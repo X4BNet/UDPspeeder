@@ -132,7 +132,7 @@ static void local_listen_cb(struct ev_loop *loop, struct ev_io *watcher, int rev
     socklen_t udp_new_addr_len = sizeof(address_t::storage_t);
     if ((data_len = recvfrom(local_listen_fd, data, max_data_len + 1, 0,
                              (struct sockaddr *)&udp_new_addr_in, &udp_new_addr_len)) == -1) {
-        mylog(log_error, "recv_from error,this shouldnt happen,err=%s,but we can try to continue\n", get_sock_error());
+        mylog(log_error, "recv_from error,this shouldn't happen,err=%s,but we can try to continue\n", get_sock_error());
         return;
     };
 
@@ -146,7 +146,7 @@ static void local_listen_cb(struct ev_loop *loop, struct ev_io *watcher, int rev
 
     mylog(log_trace, "Received packet from %s,len: %d\n", addr.get_str(), data_len);
 
-    if (!disable_mtu_warn && data_len >= mtu_warn)  ///////////////////////delete this for type 0 in furture
+    if (!disable_mtu_warn && data_len >= mtu_warn)  ///////////////////////delete this for type 0 in future
     {
         mylog(log_warn, "huge packet,data len=%d (>=%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ", data_len, mtu_warn);
     }

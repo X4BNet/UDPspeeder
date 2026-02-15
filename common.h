@@ -122,7 +122,7 @@ const u32_t client_retry_interval=1000;
 
 const u32_t server_handshake_timeout=10000;// this should be much longer than clients. client retry initially ,server retry passtively*/
 
-const int conv_clear_ratio = 30;  // conv grabage collecter check 1/30 of all conv one time
+const int conv_clear_ratio = 30;  // conv garbage collector check 1/30 of all conv one time
 const int conn_clear_ratio = 50;
 const int conv_clear_min = 1;
 const int conn_clear_min = 1;
@@ -270,13 +270,13 @@ struct address_t  // TODO scope id
     char *get_str();
     void to_str(char *);
 
-    inline int is_vaild() {
+    inline int is_valid() {
         u32_t ret = ((sockaddr *)&inner)->sa_family;
         return (ret == AF_INET || ret == AF_INET6);
     }
 
     inline u32_t get_type() {
-        assert(is_vaild());
+        assert(is_valid());
         u32_t ret = ((sockaddr *)&inner)->sa_family;
         return ret;
     }

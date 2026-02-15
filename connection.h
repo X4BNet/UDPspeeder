@@ -293,8 +293,8 @@ struct conn_manager_t  //manager for connections. for client,we dont need conn_m
                 assert(0==1);
         }
         int exist(ip_port_t);
-        conn_info_t *& find_p(ip_port_t);  //be aware,the adress may change after rehash
-        conn_info_t & find(ip_port_t) ; //be aware,the adress may change after rehash
+        conn_info_t *& find_p(ip_port_t);  //be aware,the address may change after rehash
+        conn_info_t & find(ip_port_t) ; //be aware,the address may change after rehash
         int insert(ip_port_t);
 
         int erase(unordered_map<u64_t,conn_info_t*>::iterator erase_it);
@@ -305,15 +305,15 @@ struct conn_manager_t  //manager for connections. for client,we dont need conn_m
 
 struct conn_manager_t  // manager for connections. for client,we dont need conn_manager since there is only one connection.for server we use one conn_manager for all connections
 {
-    unordered_map<address_t, conn_info_t *> mp;  // put it at end so that it de-consturcts first
+    unordered_map<address_t, conn_info_t *> mp;  // put it at end so that it de-constructs first
     unordered_map<address_t, conn_info_t *>::iterator clear_it;
 
     long long last_clear_time;
 
     conn_manager_t();
     int exist(address_t addr);
-    conn_info_t *&find_insert_p(address_t addr);  // be aware,the adress may change after rehash //not true?
-    conn_info_t &find_insert(address_t addr);     // be aware,the adress may change after rehash
+    conn_info_t *&find_insert_p(address_t addr);  // be aware,the address may change after rehash //not true?
+    conn_info_t &find_insert(address_t addr);     // be aware,the address may change after rehash
 
     int erase(unordered_map<address_t, conn_info_t *>::iterator erase_it);
     int clear_inactive();

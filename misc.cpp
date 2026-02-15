@@ -241,7 +241,7 @@ int handle_command(char *s) {
         /*
         if(a<1||b<0||a+b>254)
         {
-                mylog(log_warn,"invaild value\n");
+                mylog(log_warn,"invalid value\n");
                 return -1;
         }*/
         int ret = tmp_par.rs_from_str(tmp_str);
@@ -259,7 +259,7 @@ int handle_command(char *s) {
         mylog(log_info, "got command [mtu]\n");
         sscanf(s, "mtu %d", &a);
         if (a < 100 || a > 2000) {
-            mylog(log_warn, "invaild value\n");
+            mylog(log_warn, "invalid value\n");
             return -1;
         }
         g_fec_par.mtu = a;
@@ -267,7 +267,7 @@ int handle_command(char *s) {
         mylog(log_info, "got command [queue-len]\n");
         sscanf(s, "queue-len %d", &a);
         if (a < 1 || a > 10000) {
-            mylog(log_warn, "invaild value\n");
+            mylog(log_warn, "invalid value\n");
             return -1;
         }
         g_fec_par.queue_len = a;
@@ -275,20 +275,20 @@ int handle_command(char *s) {
         mylog(log_info, "got command [mode]\n");
         sscanf(s, "mode %d", &a);
         if (a != 0 && a != 1) {
-            mylog(log_warn, "invaild value\n");
+            mylog(log_warn, "invalid value\n");
             return -1;
         }
         if (g_fec_par.mode != a) {
             g_fec_par.mode = a;
 
-            assert(g_fec_par.rs_from_str(rs_par_str) == 0);  // re parse rs_par_str,not necessary at the moment, for futher use
+            assert(g_fec_par.rs_from_str(rs_par_str) == 0);  // re parse rs_par_str,not necessary at the moment, for further use
             g_fec_par.version++;
         }
     } else if (strncmp(s, "timeout", strlen("timeout")) == 0) {
         mylog(log_info, "got command [timeout]\n");
         sscanf(s, "timeout %d", &a);
         if (a < 0 || a > 1000) {
-            mylog(log_warn, "invaild value\n");
+            mylog(log_warn, "invalid value\n");
             return -1;
         }
         g_fec_par.timeout = a * 1000;
@@ -854,11 +854,11 @@ void process_arg(int argc, char *argv[]) {
     }
 
     if (is_client == 0 && is_server == 0) {
-        mylog(log_fatal, "-s -c hasnt been set\n");
+        mylog(log_fatal, "-s -c hasn't been set\n");
         myexit(-1);
     }
     if (is_client == 1 && is_server == 1) {
-        mylog(log_fatal, "-s -c cant be both set\n");
+        mylog(log_fatal, "-s -c can't be both set\n");
         myexit(-1);
     }
     if (is_client == 1) {

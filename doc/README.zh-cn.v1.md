@@ -87,8 +87,8 @@ main options:
                                           know what it means
     --report              <number>        turn on udp send/recv report,and set a time interval for reporting,unit:s
 advanced options:
-    -t                    tmin:tmax       simliar to -t above,but delay randomly between tmin and tmax
-    -j                    jmin:jmax       simliar to -j above,but create jitter randomly between jmin and jmax
+    -t                    tmin:tmax       similar to -t above,but delay randomly between tmin and tmax
+    -j                    jmin:jmax       similar to -j above,but create jitter randomly between jmin and jmax
     --random-drop         <number>        simulate packet loss ,unit:0.01%
     --disable-filter                      disable duplicate packet filter.
     -m                    <number>        max pending packets,to prevent the program from eating up all your memory,
