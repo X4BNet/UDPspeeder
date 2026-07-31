@@ -51,7 +51,7 @@ cygwin:git_version
 #targes for general cross compile
 
 cross:git_version
-	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -O2
+	${CXX}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} ${CXXFLAGS} ${LDFLAGS} -lrt -O2
 
 cross2:git_version
 	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -lgcc_eh -O2
@@ -115,5 +115,6 @@ clean:
 	rm -f ${NAME} ${NAME}_cross ${NAME}.exe ${NAME}_wepoll.exe ${NAME}_mac
 	rm -f git_version.h
 
+gitversion ?= $(shell git rev-parse HEAD 2>/dev/null)
 git_version:
-	    echo "const char *gitversion = \"$(shell git rev-parse HEAD)\";" > git_version.h
+	    echo "const char *gitversion = \"$(gitversion)\";" > git_version.h
