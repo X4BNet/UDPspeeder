@@ -36,7 +36,7 @@ uint32_t crc32_combine (uint32_t crcA, uint32_t crcB, size_t lengthB);
 
 /// compute CRC32 (bitwise algorithm)
 uint32_t crc32_bitwise (const void* data, size_t length, uint32_t previousCrc32 = 0);
-/// compute CRC32 (half-byte algoritm)
+/// compute CRC32 (half-byte algorithm)
 uint32_t crc32_halfbyte(const void* data, size_t length, uint32_t previousCrc32 = 0);
 
 #ifdef CRC32_USE_LOOKUP_TABLE_BYTE

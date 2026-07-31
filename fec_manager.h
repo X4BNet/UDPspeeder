@@ -54,7 +54,7 @@ struct fec_parameter_t {
                 return -1;
             }
             if (x < 1 || y < 0 || x + y > max_fec_packet_num) {
-                mylog(log_warn, "invaild value x=%d y=%d, x should >=1, y should >=0, x +y should <%d\n", x, y, max_fec_packet_num);
+                mylog(log_warn, "invalid value x=%d y=%d, x should >=1, y should >=0, x +y should <%d\n", x, y, max_fec_packet_num);
                 return -1;
             }
             tmp_par.x = x;
@@ -203,8 +203,8 @@ struct anti_replay_t {
         index = 0;
         return 0;
     }
-    void set_invaild(u32_t seq) {
-        if (is_vaild(seq) == 0) {
+    void set_invalid(u32_t seq) {
+        if (is_valid(seq) == 0) {
             mylog(log_trace, "seq %u exist\n", seq);
             // assert(mp.find(seq)!=mp.end());
             // mp[seq].my_time=get_current_time_rough();
@@ -221,7 +221,7 @@ struct anti_replay_t {
         index++;
         if (index == int(anti_replay_buff_size)) index = 0;
     }
-    int is_vaild(u32_t seq) {
+    int is_valid(u32_t seq) {
         if (mp.find(seq) == mp.end()) return 1;
 
         if (get_current_time() - mp[seq].my_time > anti_replay_timeout) {

@@ -124,14 +124,14 @@ advanced options:
                                           mode 1 usually introduces less latency, but you have to care about mtu.
     --mtu                 <number>        mtu. for mode 0, the program will split packet to segment smaller than mtu value.
                                           for mode 1, no packet will be split, the program just check if the mtu is exceed.
-                                          default value: 1250. you typically shouldnt change this value.
+                                          default value: 1250. you typically shouldn't change this value.
     -q,--queue-len        <number>        fec queue len, only for mode 0, fec will be performed immediately after queue is full.
                                           default value: 200. 
     -j,--jitter           <number>        simulated jitter. randomly delay first packet for 0~<number> ms, default value: 0.
                                           do not use if you dont know what it means.
     -i,--interval         <number>        scatter each fec group to a interval of <number> ms, to protect burst packet loss.
                                           default value: 0. do not use if you dont know what it means.
-    -f,--fec              x1:y1,x2:y2,..  similiar to -f/--fec above,fine-grained fec parameters,may help save bandwidth.
+    -f,--fec              x1:y1,x2:y2,..  similar to -f/--fec above,fine-grained fec parameters,may help save bandwidth.
                                           example: "-f 1:3,2:4,10:6,20:10". check repo for details
     --random-drop         <number>        simulate packet loss, unit: 0.01%. default value: 0.
     --disable-obscure     <number>        disable obscure, to save a bit bandwidth and cpu.
@@ -139,8 +139,8 @@ developer options:
     --fifo                <string>        use a fifo(named pipe) for sending commands to the running program, so that you
                                           can change fec encode parameters dynamically, check readme.md in repository for
                                           supported commands.
-    -j ,--jitter          jmin:jmax       similiar to -j above, but create jitter randomly between jmin and jmax
-    -i,--interval         imin:imax       similiar to -i above, but scatter randomly between imin and imax
+    -j ,--jitter          jmin:jmax       similar to -j above, but create jitter randomly between jmin and jmax
+    -i,--interval         imin:imax       similar to -i above, but scatter randomly between imin and imax
     --decode-buf          <number>        size of buffer of fec decoder,u nit: packet, default: 2000
     --fix-latency         <number>        try to stabilize latency, only for mode 0
     --delay-capacity      <number>        max number of delayed packets

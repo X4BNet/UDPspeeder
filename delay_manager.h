@@ -88,7 +88,7 @@ struct my_timer_t
                 memset(&its,0,sizeof(its));
                 its.it_interval.tv_sec=my_time/1000000llu;
                 its.it_interval.tv_nsec=my_time%1000000llu*1000llu;
-                its.it_value.tv_nsec=1; //imidiately
+                its.it_value.tv_nsec=1; //immediately
                 timerfd_settime(timer_fd,0,&its,0);
                 return 0;
         }

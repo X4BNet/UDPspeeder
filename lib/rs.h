@@ -23,10 +23,10 @@
 void rs_encode(void *code, char *data[], int size);
 
 // input:
-// data[0.....n-1] points to original data and redundate data,in right order
-// if data[i] is missing ,set poniter data[i] to 0 (point it to null)
+// data[0.....n-1] points to original data and redundant data,in right order
+// if data[i] is missing ,set pointer data[i] to 0 (point it to null)
 //
-// outout:
+// output:
 // data[0.....k-1] will point to the recovered original data.
 //
 // info:
@@ -34,7 +34,7 @@ void rs_encode(void *code, char *data[], int size);
 // if the number of no-zero pointers is less than k,the function will fail and return non-zero
 //
 // advanced info:
-// 1. rs_decode wont malloc memory for those zero pointers in data[0.....k-1]. instead it will re-use the memory of other non-zero pointers (and let data[0.....k-1] point to those memory).
+// 1. rs_decode won't malloc memory for those zero pointers in data[0.....k-1]. instead it will reuse the memory of other non-zero pointers (and let data[0.....k-1] point to those memory).
 // 2. if the input data[0.....n-1] contains x non-zero pointers,after called rs_decode,there will still be exactly x non-zero poninters in data[0.....n-1],just the order may change.
 int rs_decode(void *code, char *data[], int size);
 

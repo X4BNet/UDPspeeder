@@ -11,7 +11,7 @@
 #include "common.h"
 #include "packet.h"
 
-struct fd_manager_t  // conver fd to a uniq 64bit number,avoid fd value conflict caused by close and re-create
+struct fd_manager_t  // convert fd to a uniq 64bit number,avoid fd value conflict caused by close and re-create
 // this class is not strictly necessary,it just makes epoll fd handling easier
 {
     fd_info_t& get_info(fd64_t fd64);

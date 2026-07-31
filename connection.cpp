@@ -42,7 +42,7 @@ int conn_manager_t::exist(address_t addr) {
     return 0;
 }
 
-conn_info_t *&conn_manager_t::find_insert_p(address_t addr)  // be aware,the adress may change after rehash
+conn_info_t *&conn_manager_t::find_insert_p(address_t addr)  // be aware,the address may change after rehash
 {
     // u64_t u64=0;
     // u64=ip;
@@ -57,7 +57,7 @@ conn_info_t *&conn_manager_t::find_insert_p(address_t addr)  // be aware,the adr
     }
     return mp[addr];
 }
-conn_info_t &conn_manager_t::find_insert(address_t addr)  // be aware,the adress may change after rehash
+conn_info_t &conn_manager_t::find_insert(address_t addr)  // be aware,the address may change after rehash
 {
     // u64_t u64=0;
     // u64=ip;

@@ -102,6 +102,6 @@ ip route add 44.55.66.77 dev XXX
 (run at client side)
 
 ##### Other Info
-You can also use tinyFecVPN,a lightweight VPN with build-in FEC support:
+You can also use tinyFecVPN,a lightweight VPN with built-in FEC support:
 
 https://github.com/wangyu-/tinyFecVPN

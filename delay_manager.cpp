@@ -71,7 +71,7 @@ int delay_manager_t::add(my_time_t delay, const dest_t &dest, char *data, int le
 
     delay_mp.insert(make_pair(tmp_time, tmp));
 
-    ////check();  check everytime when add, is it better ??
+    ////check();  check every time when add, is it better ??
 
     return 0;
 }

@@ -113,7 +113,7 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
         default:
             return NULL;
     }
-    /* cannot direclty use &size because of strict aliasing rules */
+    /* cannot directly use &size because of strict aliasing rules */
     return (WSAAddressToString((struct sockaddr *)&ss, sizeof(ss), NULL, dst, &s) == 0) ? dst : NULL;
 }
 char *get_sock_error() {
@@ -193,11 +193,11 @@ int address_t::from_str(char *str) {
     mylog(log_info, "parsing address: %s\n", str);
     int is_ipv6 = 0;
     if (sscanf(str, "[%[^]]]:%u", ip_addr_str, &port) == 2) {
-        mylog(log_info, "its an ipv6 adress\n");
+        mylog(log_info, "its an ipv6 address\n");
         inner.ipv6.sin6_family = AF_INET6;
         is_ipv6 = 1;
     } else if (sscanf(str, "%[^:]:%u", ip_addr_str, &port) == 2) {
-        mylog(log_info, "its an ipv4 adress\n");
+        mylog(log_info, "its an ipv4 address\n");
         inner.ipv4.sin_family = AF_INET;
     } else {
         mylog(log_error, "failed to parse\n");
@@ -215,7 +215,7 @@ int address_t::from_str(char *str) {
     if (is_ipv6) {
         ret = inet_pton(AF_INET6, ip_addr_str, &(inner.ipv6.sin6_addr));
         inner.ipv6.sin6_port = htons(port);
-        if (ret == 0)  // 0 if address type doesnt match
+        if (ret == 0)  // 0 if address type doesn't match
         {
             mylog(log_error, "ip_addr %s is not an ipv6 address, %d\n", ip_addr_str, ret);
             myexit(-1);
@@ -263,7 +263,7 @@ int address_t::from_str_ip_only(char *str) {
         ret = inet_pton(type, str, &inner.ipv6.sin6_addr);
     }
 
-    if (ret == 0)  // 0 if address type doesnt match
+    if (ret == 0)  // 0 if address type doesn't match
     {
         mylog(log_error, "confusion in parsing %s, %d\n", str, ret);
         myexit(-1);
@@ -701,7 +701,7 @@ int set_timer_ms(int epollfd,int &timer_fd,u32_t timer_interval)
         }
         its.it_interval.tv_sec=(timer_interval/1000);
         its.it_interval.tv_nsec=(timer_interval%1000)*1000ll*1000ll;
-        its.it_value.tv_nsec=1; //imidiately
+        its.it_value.tv_nsec=1; //immediately
         timerfd_settime(timer_fd,0,&its,0);
 
 
