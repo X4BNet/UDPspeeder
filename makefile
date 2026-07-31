@@ -51,13 +51,16 @@ cygwin:git_version
 #targes for general cross compile
 
 cross:git_version
-	${CXX}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} ${CXXFLAGS} ${LDFLAGS} -lrt -O2
+	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -O2
 
 cross2:git_version
 	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -lgcc_eh -O2
 
 cross3:git_version
 	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -O2
+
+cross_cxx:git_version
+	${CXX}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -O2 ${CXXFLAGS} ${LDFLAGS} ${LDLIBS}
 
 #targets only for debug purpose
 fast: git_version
