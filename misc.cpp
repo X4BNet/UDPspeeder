@@ -6,6 +6,7 @@
  */
 
 #include "misc.h"
+#include "immediate_send_batch.h"
 
 char fifo_file[1000] = "";
 
@@ -400,6 +401,7 @@ static void empty_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents
 int unit_test() {
     assert(adaptive_fec_unit_test() == 0);
     assert(receive_batch_unit_test() == 0);
+    assert(immediate_send_batch_unit_test() == 0);
 
     // Exercise the encoder/decoder k=1 replication fast path, including
     // recovery from a parity-only mode-0 group and a mode-1 group.  The

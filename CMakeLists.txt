@@ -17,6 +17,7 @@ set(SOURCE_FILES
         crc32/Crc32.cpp
         packet.cpp
         delay_manager.cpp
+        immediate_send_batch.cpp
         receive_batch.cpp
         fd_manager.cpp
         connection.cpp

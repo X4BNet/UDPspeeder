@@ -6,6 +6,7 @@
  */
 
 #include "tunnel.h"
+#include "immediate_send_batch.h"
 
 static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents);
 static void fec_encode_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents);
@@ -18,6 +19,8 @@ namespace {
 // until each synchronous callback finishes.
 udp_receive_batch_t local_receive_batch;
 udp_receive_batch_t remote_receive_batch;
+immediate_send_batch_t local_output_batch;
+immediate_send_batch_t remote_output_batch;
 
 int receive_event_limit() {
     return get_receive_batch_size() > 1 ? max_receive_packets_per_callback : 1;
@@ -85,7 +88,7 @@ void data_from_fec_timeout_or_conn_timer(conn_info_t &conn_info, tmp_mode_t mode
     delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
 }
 
-static void process_remote_datagram(conn_info_t &conn_info, fd64_t fd64, char *data, int data_len) {
+static void process_remote_datagram(conn_info_t &conn_info, fd64_t fd64, char *data, int data_len, immediate_send_batch_t &output_batch) {
     if (!fd_manager.exist(fd64)) {
         mylog(log_warn, "!fd_manager.exist(fd64)\n");
         return;
@@ -118,10 +121,12 @@ static void process_remote_datagram(conn_info_t &conn_info, fd64_t fd64, char *d
     dest.type = type_fd_addr;
     dest.cook = 1;
     from_normal_to_fec(conn_info, new_data, new_len, out_n, out_arr, out_len, out_delay);
-    delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
+    for (int i = 0; i < out_n; i++) {
+        output_batch.add(out_delay[i], dest, out_arr[i], out_len[i]);
+    }
 }
 
-static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, char *data, int data_len, address_t addr) {
+static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, char *data, int data_len, address_t addr, immediate_send_batch_t *output_batch = 0) {
     int ret;
 
     if (data_len == max_data_len + 1) {
@@ -235,7 +240,10 @@ static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, ch
         dest_t dest;
         dest.type = type_fd64;
         dest.inner.fd64 = fd64;
-        delay_send(out_delay[i], dest, new_data, new_len);
+        if (output_batch != 0)
+            output_batch->add(out_delay[i], dest, new_data, new_len);
+        else
+            delay_send(out_delay[i], dest, new_data, new_len);
     }
 }
 
@@ -244,22 +252,31 @@ static void local_listen_cb(struct ev_loop *loop, struct ev_io *watcher, int rev
 
     int processed = 0;
     int event_limit = receive_event_limit();
+    local_output_batch.clear();
     while (processed < event_limit) {
         int requested = min(get_receive_batch_size(), event_limit - processed);
         int received = local_receive_batch.receive(watcher->fd, 1, requested);
         if (received < 0) {
             mylog(log_warn, "recv_from failed,err=%s\n", get_sock_error());
+            local_output_batch.flush();
             return;
         }
-        if (received == 0) return;
+        if (received == 0) {
+            local_output_batch.flush();
+            return;
+        }
         for (int i = 0; i < received; i++) {
             address_t addr;
             addr.from_sockaddr((sockaddr *)&local_receive_batch.packets[i].address, local_receive_batch.packets[i].address_len);
-            process_local_datagram(loop, watcher->fd, local_receive_batch.packets[i].data, local_receive_batch.packets[i].len, addr);
+            process_local_datagram(loop, watcher->fd, local_receive_batch.packets[i].data, local_receive_batch.packets[i].len, addr, &local_output_batch);
         }
         processed += received;
-        if (received < requested) return;
+        if (received < requested) {
+            local_output_batch.flush();
+            return;
+        }
     }
+    local_output_batch.flush();
 }
 
 static void remote_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -271,20 +288,29 @@ static void remote_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
 
     int processed = 0;
     int event_limit = receive_event_limit();
+    remote_output_batch.clear();
     while (processed < event_limit) {
         int requested = min(get_receive_batch_size(), event_limit - processed);
         int received = remote_receive_batch.receive(fd_manager.to_fd(fd64), 0, requested);
         if (received < 0) {
             mylog(log_warn, "recv failed,err=%s\n", get_sock_error());
+            remote_output_batch.flush();
             return;
         }
-        if (received == 0) return;
+        if (received == 0) {
+            remote_output_batch.flush();
+            return;
+        }
         for (int i = 0; i < received; i++) {
-            process_remote_datagram(conn_info, fd64, remote_receive_batch.packets[i].data, remote_receive_batch.packets[i].len);
+            process_remote_datagram(conn_info, fd64, remote_receive_batch.packets[i].data, remote_receive_batch.packets[i].len, remote_output_batch);
         }
         processed += received;
-        if (received < requested) return;
+        if (received < requested) {
+            remote_output_batch.flush();
+            return;
+        }
     }
+    remote_output_batch.flush();
 }
 
 static void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
