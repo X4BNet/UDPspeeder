@@ -124,6 +124,12 @@ developer options:
     --fix-latency         <number>        try to stabilize latency, only for mode 0
     --delay-capacity      <number>        max number of delayed packets
     --disable-fec         <number>        completely disable fec, turn the program into a normal udp tunnel
+    --adaptive-fec                        opt-in receiver-feedback FEC state machine; use matching 16+ byte -k in production
+    --adaptive-normal     <x:y,...>       normal profile; default zero redundancy uses the direct bypass fast path
+    --adaptive-guard      <x:y,...>       guard profile; default is one third of configured redundancy
+    --adaptive-degraded   <x:y,...>       degraded profile; default is the configured --fec profile
+    --adaptive-feedback-ms <number>       receiver feedback interval, 100..10000ms, default 500ms
+    --adaptive-recover-ms <number>        clean-link hold before normal, 1000..60000ms, default 10000ms
     --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024
 log and help options:
     --log-level           <number>        0: never    1: fatal   2: error   3: warn 
@@ -133,6 +139,39 @@ log and help options:
     -h,--help                             print this help message
 
 ```
+
+#### `--adaptive-fec` option
+
+`--adaptive-fec` is an opt-in, both-peers feature. If `-k/--key` is omitted,
+its control frames use the built-in `UDPspeeder-adaptive-fec-v1` compatibility
+key; this is not a secret and provides no authentication against a party that
+knows the implementation. Production peers must use a matching, high-entropy
+`-k/--key` of at least 16 bytes. It starts with the normal state and uses a direct packet fast path when the normal profile has no
+redundancy. The receiver reports delivered, recovered, unrecoverable, and
+reordered packet observations to its sender. The sender moves through
+`normal`, `guard`, `degraded`, and `recover`; it holds the recover state before
+returning to normal, preventing rapid FEC flapping.
+
+The initial thresholds are deliberately conservative lab defaults: enter Guard
+at 1% unrecoverable packets, 2% recovered packets, or 5% reordering; enter
+Degraded at 3% unrecoverable or 12% recovered packets. Three clean observation
+windows enter Recover, and the configured recover hold plus three further clean
+windows returns to Normal. The first loss during Normal is necessarily
+unrecoverable; the goal is to prevent sustained loss after feedback reaches the
+sender.
+
+The default normal profile is the configured FEC shape with all redundancy set
+to zero. Guard defaults to one third of each configured redundancy value
+(rounded up), and degraded defaults to the configured `--fec` profile. Override
+them only after lab qualification.
+
+The control and direct-bypass frames carry a keyed SipHash-2-4 MAC in addition
+to UDPspeeder's existing cooked packet envelope. Capability probes are encoded
+as valid legacy zero-payload FEC groups, so an older peer harmlessly consumes
+them. A peer that does not answer the bounded probes remains on the original
+static FEC profile; do not enable this option against an unchanged relay such
+as Amsterdam.
+
 #### `--fifo` option
 Use a fifo(named pipe) for sending commands to the running program. For example `--fifo fifo.file`, you can use following commands to change parameters dynamically:
 ```

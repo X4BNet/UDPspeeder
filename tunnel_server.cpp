@@ -64,8 +64,11 @@ void data_from_remote_or_fec_timeout_or_conn_timer(conn_info_t &conn_info, fd64_
         // uint64_t value;
         // read(conn_info.timer.get_timer_fd(), &value, 8);
         conn_info.conv_manager.s.clear_inactive();
-        if (debug_force_flush_fec) {
+        if (debug_force_flush_fec || conn_info.adaptive_fec.is_enabled()) {
             from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
+            for (int i = 0; i < out_n; i++) {
+                delay_send(out_delay[i], dest, out_arr[i], out_len[i]);
+            }
         }
 
         conn_info.stat.report_as_server(addr);

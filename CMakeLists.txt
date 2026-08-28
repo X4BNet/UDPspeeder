@@ -14,11 +14,13 @@ set(SOURCE_FILES
         common.cpp
         lib/fec.cpp
         lib/rs.cpp
+        crc32/Crc32.cpp
         packet.cpp
         delay_manager.cpp
         fd_manager.cpp
         connection.cpp
         fec_manager.cpp
+        adaptive_fec.cpp
         misc.cpp
         tunnel_client.cpp
         tunnel_server.cpp

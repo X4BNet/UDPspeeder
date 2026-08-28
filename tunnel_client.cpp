@@ -219,7 +219,7 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
 
     conn_info.stat.report_as_client();
 
-    if (debug_force_flush_fec) {
+    if (debug_force_flush_fec || conn_info.adaptive_fec.is_enabled()) {
         int out_n;
         char **out_arr;
         int *out_len;

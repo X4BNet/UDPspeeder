@@ -23,6 +23,13 @@ extern int header_overhead;
 extern int debug_fec_enc;
 extern int debug_fec_dec;
 
+struct fec_decode_stats_t {
+    u32_t delivered_packets = 0;
+    u32_t recovered_packets = 0;
+    u32_t unrecoverable_packets = 0;
+    u32_t reordered_packets = 0;
+};
+
 struct fec_parameter_t {
     int version = 0;
     int mtu = default_mtu;
@@ -156,7 +163,7 @@ struct fec_parameter_t {
         return rs_par[rs_cnt - 1];
     }
 
-    int clone(fec_parameter_t &other) {
+    int clone(const fec_parameter_t &other) {
         version = other.version;
         mtu = other.mtu;
         queue_len = other.queue_len;
@@ -170,7 +177,7 @@ struct fec_parameter_t {
         return 0;
     }
 
-    int copy_fec(fec_parameter_t &other) {
+    int copy_fec(const fec_parameter_t &other) {
         assert(other.rs_cnt >= 1);
         rs_cnt = other.rs_cnt;
         memcpy(rs_par, other.rs_par, sizeof(rs_parameter_t) * rs_cnt);
@@ -278,6 +285,8 @@ class fec_encode_manager_t : not_copy_able_t {
     // int fec_queue_len;
     // int fec_timeout;
     fec_parameter_t fec_par;
+    fec_parameter_t pending_fec_par;
+    int has_pending_fec_update;
 
     my_time_t first_packet_time;
     my_time_t first_packet_time_for_output;
@@ -358,6 +367,13 @@ class fec_encode_manager_t : not_copy_able_t {
     int get_type() {
         return fec_par.mode;
     }
+    int is_idle() const {
+        return counter == 0 && ready_for_output == 0;
+    }
+    void request_fec_parameter(const fec_parameter_t &parameter) {
+        pending_fec_par.clone(parameter);
+        has_pending_fec_update = 1;
+    }
     // u64_t get_timer_fd64();
     int reset_fec_parameter(int data_num, int redundant_num, int mtu, int pending_num, int pending_time, int type);
     int input(char *s, int len /*,int &is_first_packet*/);
@@ -379,6 +395,8 @@ struct fec_group_t {
     int redundant_num = -1;
     int len = -1;
     int fec_done = 0;
+    my_time_t first_seen_time = 0;
+    int highest_inner_index = -1;
     // int data_counter=0;
     map<int, int> group_mp;
 };
@@ -394,6 +412,7 @@ class fec_decode_manager_t : not_copy_able_t {
     char **output_s_arr;
     int *output_len_arr;
     int ready_for_output;
+    fec_decode_stats_t statistics;
 
     char *output_s_arr_buf[max_fec_packet_num + 100];  // only for type=1,for type=0 the buf inside blot_t is used
     int output_len_arr_buf[max_fec_packet_num + 100];  // same
@@ -425,6 +444,7 @@ class fec_decode_manager_t : not_copy_able_t {
             fec_data[i].used = 0;
         ready_for_output = 0;
         index = 0;
+        statistics = fec_decode_stats_t();
 
         return 0;
     }
@@ -432,6 +452,12 @@ class fec_decode_manager_t : not_copy_able_t {
     // int re_init();
     int input(char *s, int len);
     int output(int &n, char **&s_arr, int *&len_arr);
+    int take_statistics(fec_decode_stats_t &stats) {
+        stats = statistics;
+        statistics = fec_decode_stats_t();
+        return 0;
+    }
+    int expire_incomplete_groups(my_time_t maximum_age_us);
 };
 
 #endif /* FEC_MANAGER_H_ */

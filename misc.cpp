@@ -58,6 +58,8 @@ char rs_par_str[rs_str_len] = "20:10";
 
 int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, char **&out_arr, int *&out_len, my_time_t *&out_delay) {
     static my_time_t out_delay_buf[max_fec_packet_num + 100] = {0};
+    static char *combined_out_arr[max_fec_packet_num + 100];
+    static int combined_out_len[max_fec_packet_num + 100];
     // static int out_len_buf[max_fec_packet_num+100]={0};
     // static int counter=0;
     out_delay = out_delay_buf;
@@ -88,25 +90,47 @@ int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, 
             inner_stat.input_packet_num++;
             inner_stat.input_packet_size += len;
         }
-        // counter++;
 
-        conn_info.fec_encode_manager.input(data, len);
+        fec_parameter_t updated_profile;
+        if (conn_info.adaptive_fec.take_profile_update(updated_profile)) {
+            conn_info.fec_encode_manager.request_fec_parameter(updated_profile);
+        }
 
-        // if(counter%5==0)
-        // conn_info.fec_encode_manager.input(0,0);
+        int direct_bypass = 0;
+        if (data != 0 && conn_info.adaptive_fec.can_bypass() && conn_info.fec_encode_manager.is_idle()) {
+            char *bypass_data = 0;
+            int bypass_data_len = 0;
+            if (conn_info.adaptive_fec.build_bypass(data, len, bypass_data, bypass_data_len) == 0) {
+                static int bypass_len;
+                bypass_len = bypass_data_len;
+                static char *bypass_arr;
+                bypass_arr = bypass_data;
+                out_arr = &bypass_arr;
+                out_len = &bypass_len;
+                out_delay_buf[0] = 0;
+                out_n = 1;
+                direct_bypass = 1;
+            }
+        }
 
-        // int n;
-        // char **s_arr;
-        // int s_len;
-
-        conn_info.fec_encode_manager.output(out_n, out_arr, out_len);
+        if (!direct_bypass) {
+            if (data == 0 && conn_info.fec_encode_manager.is_idle()) {
+                out_n = 0;
+                out_arr = 0;
+                out_len = 0;
+            } else {
+                conn_info.fec_encode_manager.input(data, len);
+                conn_info.fec_encode_manager.output(out_n, out_arr, out_len);
+                if (out_n < 0) out_n = 0;
+            }
+        }
 
         if (out_n > 0) {
             my_time_t common_latency = 0;
-            my_time_t first_packet_time = conn_info.fec_encode_manager.get_first_packet_time();
 
-            if (fix_latency == 1 && conn_info.fec_encode_manager.get_type() == 0) {
+            if (!direct_bypass && fix_latency == 1 && conn_info.fec_encode_manager.get_type() == 0) {
                 my_time_t current_time = get_current_time_us();
+                my_time_t first_packet_time = conn_info.fec_encode_manager.get_first_packet_time();
                 my_time_t tmp;
                 assert(first_packet_time != 0);
                 // mylog(log_info,"current_time=%llu first_packlet_time=%llu   fec_pending_time=%llu\n",current_time,first_packet_time,(my_time_t)fec_pending_time);
@@ -127,6 +151,25 @@ int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, 
             for (int i = 1; i < out_n; i++) {
                 out_delay_buf[i] = out_delay_buf[i - 1] + (my_time_t)(random_between(output_interval_min, output_interval_max) / (out_n - 1));
             }
+        }
+
+        char *control_data = 0;
+        int control_len = 0;
+        if (conn_info.adaptive_fec.build_pending_control(control_data, control_len)) {
+            assert(out_n + 1 < max_fec_packet_num + 100);
+            combined_out_arr[0] = control_data;
+            combined_out_len[0] = control_len;
+            for (int i = 0; i < out_n; i++) {
+                combined_out_arr[i + 1] = out_arr[i];
+                combined_out_len[i + 1] = out_len[i];
+            }
+            for (int i = out_n; i > 0; i--) {
+                out_delay_buf[i] = out_delay_buf[i - 1];
+            }
+            out_delay_buf[0] = 0;
+            out_n++;
+            out_arr = combined_out_arr;
+            out_len = combined_out_len;
         }
 
         if (out_n > 0) {
@@ -181,15 +224,38 @@ int from_fec_to_normal(conn_info_t &conn_info, char *data, int len, int &out_n, 
             inner_stat.input_packet_size += len;
         }
 
-        conn_info.fec_decode_manager.input(data, len);
-
-        // int n;char ** s_arr;int* len_arr;
-        conn_info.fec_decode_manager.output(out_n, out_arr, out_len);
-        for (int i = 0; i < out_n; i++) {
-            out_delay_buf[i] = 0;
-
+        char *bypass_payload = 0;
+        int bypass_payload_len = 0;
+        adaptive_fec_inbound_result_t adaptive_result = conn_info.adaptive_fec.process_inbound(data, len, bypass_payload, bypass_payload_len);
+        if (adaptive_result == adaptive_fec_consumed) {
+            out_n = 0;
+        } else if (adaptive_result == adaptive_fec_bypass) {
+            static char *bypass_out_arr;
+            static int bypass_out_len;
+            bypass_out_arr = bypass_payload;
+            bypass_out_len = bypass_payload_len;
+            out_n = 1;
+            out_arr = &bypass_out_arr;
+            out_len = &bypass_out_len;
+            out_delay_buf[0] = 0;
             inner_stat.output_packet_num++;
-            inner_stat.output_packet_size += out_len[i];
+            inner_stat.output_packet_size += bypass_payload_len;
+        } else {
+            conn_info.fec_decode_manager.input(data, len);
+            conn_info.fec_decode_manager.expire_incomplete_groups(g_adaptive_fec_config.enabled ? g_adaptive_fec_config.incomplete_group_timeout_us : 0);
+
+            fec_decode_stats_t decoder_stats;
+            conn_info.fec_decode_manager.take_statistics(decoder_stats);
+            conn_info.adaptive_fec.observe_decoder_stats(decoder_stats);
+
+            conn_info.fec_decode_manager.output(out_n, out_arr, out_len);
+            if (out_n < 0) out_n = 0;
+            for (int i = 0; i < out_n; i++) {
+                out_delay_buf[i] = 0;
+
+                inner_stat.output_packet_num++;
+                inner_stat.output_packet_size += out_len[i];
+            }
         }
     }
 
@@ -225,6 +291,13 @@ int print_parameter() {
           jitter_min / 1000, jitter_max / 1000, output_interval_min / 1000, output_interval_max / 1000, g_fec_par.timeout / 1000, g_fec_par.mtu, g_fec_par.queue_len, g_fec_par.mode);
     mylog(log_info, "fec_str=%s\n", rs_par_str);
     mylog(log_info, "fec_inner_parameter=%s\n", g_fec_par.rs_to_str());
+    if (g_adaptive_fec_config.enabled) {
+        mylog(log_info, "adaptive_fec enabled: feedback_ms=%d recover_hold_ms=%d min_samples=%d\n",
+              g_adaptive_fec_config.feedback_interval_us / 1000, g_adaptive_fec_config.recover_hold_us / 1000, g_adaptive_fec_config.minimum_samples);
+        mylog(log_info, "adaptive_fec normal=%s\n", g_adaptive_fec_config.normal.rs_to_str());
+        mylog(log_info, "adaptive_fec guard=%s\n", g_adaptive_fec_config.guard.rs_to_str());
+        mylog(log_info, "adaptive_fec degraded=%s\n", g_adaptive_fec_config.degraded.rs_to_str());
+    }
     return 0;
 }
 int handle_command(char *s) {
@@ -303,6 +376,57 @@ int handle_command(char *s) {
 static void empty_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
 }
 int unit_test() {
+    assert(adaptive_fec_unit_test() == 0);
+
+    // Exercise the encoder/decoder k=1 replication fast path, including
+    // recovery from a parity-only mode-0 group and a mode-1 group.  The
+    // manager owns fixed send/receive buffers, so this also guards the
+    // allocation-free hot path used by short adaptive-FEC groups.
+    {
+        fec_parameter_t saved_fec = g_fec_par;
+        char k1_profile[] = "1:4";
+        assert(g_fec_par.rs_from_str(k1_profile) == 0);
+        g_fec_par.version++;
+        g_fec_par.mode = 0;
+
+        fec_encode_manager_t encoder;
+        fec_decode_manager_t decoder;
+        encoder.set_loop_and_cb(ev_default_loop(0), empty_cb);
+        char packet[] = "k1-replication-mode-zero";
+        assert(encoder.input(packet, (int)strlen(packet)) == 0);
+        assert(encoder.input(0, 0) == 0);
+
+        int encoded_count;
+        char **encoded;
+        int *encoded_lengths;
+        assert(encoder.output(encoded_count, encoded, encoded_lengths) == 0);
+        assert(encoded_count == 5);
+        assert(decoder.input(encoded[4], encoded_lengths[4]) == 0);
+
+        int decoded_count;
+        char **decoded;
+        int *decoded_lengths;
+        assert(decoder.output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == 1);
+        assert(decoded_lengths[0] == (int)strlen(packet));
+        assert(memcmp(decoded[0], packet, decoded_lengths[0]) == 0);
+
+        g_fec_par.mode = 1;
+        fec_encode_manager_t mode_one_encoder;
+        fec_decode_manager_t mode_one_decoder;
+        mode_one_encoder.set_loop_and_cb(ev_default_loop(0), empty_cb);
+        char mode_one_packet[] = "k1-replication-mode-one";
+        assert(mode_one_encoder.input(mode_one_packet, (int)strlen(mode_one_packet)) == 0);
+        assert(mode_one_encoder.output(encoded_count, encoded, encoded_lengths) == 0);
+        assert(encoded_count == 5);
+        assert(mode_one_decoder.input(encoded[4], encoded_lengths[4]) == 0);
+        assert(mode_one_decoder.output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == 1);
+        assert(decoded_lengths[0] == (int)strlen(mode_one_packet));
+        assert(memcmp(decoded[0], mode_one_packet, decoded_lengths[0]) == 0);
+
+        g_fec_par = saved_fec;
+    }
     {
         union test_t {
             u64_t u64;
@@ -543,6 +667,10 @@ void process_arg(int argc, char *argv[]) {
     int is_client = 0, is_server = 0;
     int i, j, k;
     int opt;
+    int adaptive_fec_requested = 0;
+    char adaptive_normal_profile[rs_str_len] = "";
+    char adaptive_guard_profile[rs_str_len] = "";
+    char adaptive_degraded_profile[rs_str_len] = "";
     static struct option long_options[] =
         {
             {"log-level", required_argument, 0, 1},
@@ -581,6 +709,12 @@ void process_arg(int argc, char *argv[]) {
             {"keep-reconnect", no_argument, 0, 1},
             {"persist-tun", no_argument, 0, 1},
             {"manual-set-tun", no_argument, 0, 1},
+            {"adaptive-fec", no_argument, 0, 1},
+            {"adaptive-normal", required_argument, 0, 1},
+            {"adaptive-guard", required_argument, 0, 1},
+            {"adaptive-degraded", required_argument, 0, 1},
+            {"adaptive-feedback-ms", required_argument, 0, 1},
+            {"adaptive-recover-ms", required_argument, 0, 1},
             {"interval", required_argument, 0, 'i'},
             {NULL, 0, 0, 0}};
     int option_index = 0;
@@ -842,6 +976,47 @@ void process_arg(int argc, char *argv[]) {
                 } else if (strcmp(long_options[option_index].name, "mssfix") == 0) {
                     sscanf(optarg, "%d", &mssfix);
                     mylog(log_warn, "mssfix=%d\n", mssfix);
+                } else if (strcmp(long_options[option_index].name, "adaptive-fec") == 0) {
+                    adaptive_fec_requested = 1;
+                } else if (strcmp(long_options[option_index].name, "adaptive-normal") == 0) {
+                    adaptive_fec_requested = 1;
+                    if (strlen(optarg) >= sizeof(adaptive_normal_profile)) {
+                        mylog(log_fatal, "adaptive normal FEC profile is too long\n");
+                        myexit(-1);
+                    }
+                    strcpy(adaptive_normal_profile, optarg);
+                } else if (strcmp(long_options[option_index].name, "adaptive-guard") == 0) {
+                    adaptive_fec_requested = 1;
+                    if (strlen(optarg) >= sizeof(adaptive_guard_profile)) {
+                        mylog(log_fatal, "adaptive guard FEC profile is too long\n");
+                        myexit(-1);
+                    }
+                    strcpy(adaptive_guard_profile, optarg);
+                } else if (strcmp(long_options[option_index].name, "adaptive-degraded") == 0) {
+                    adaptive_fec_requested = 1;
+                    if (strlen(optarg) >= sizeof(adaptive_degraded_profile)) {
+                        mylog(log_fatal, "adaptive degraded FEC profile is too long\n");
+                        myexit(-1);
+                    }
+                    strcpy(adaptive_degraded_profile, optarg);
+                } else if (strcmp(long_options[option_index].name, "adaptive-feedback-ms") == 0) {
+                    adaptive_fec_requested = 1;
+                    int milliseconds = -1;
+                    sscanf(optarg, "%d", &milliseconds);
+                    if (milliseconds < 100 || milliseconds > 10000) {
+                        mylog(log_fatal, "adaptive feedback interval must be between 100 and 10000ms\n");
+                        myexit(-1);
+                    }
+                    g_adaptive_fec_config.feedback_interval_us = milliseconds * 1000;
+                } else if (strcmp(long_options[option_index].name, "adaptive-recover-ms") == 0) {
+                    adaptive_fec_requested = 1;
+                    int milliseconds = -1;
+                    sscanf(optarg, "%d", &milliseconds);
+                    if (milliseconds < 1000 || milliseconds > 60000) {
+                        mylog(log_fatal, "adaptive recovery hold must be between 1000 and 60000ms\n");
+                        myexit(-1);
+                    }
+                    g_adaptive_fec_config.recover_hold_us = milliseconds * 1000;
                 } else {
                     mylog(log_fatal, "unknown option\n");
                     myexit(-1);
@@ -888,6 +1063,18 @@ void process_arg(int argc, char *argv[]) {
     if (ret != 0) {
         mylog(log_fatal, "failed to parse [%s]\n", rs_par_str);
         myexit(-1);
+    }
+
+    if (adaptive_fec_requested) {
+        if (key_string[0] != 0 && strlen(key_string) < 16) {
+            mylog(log_fatal, "--adaptive-fec needs a 16+ byte -k/--key value, or no key to use the built-in compatibility key\n");
+            myexit(-1);
+        }
+        if (g_adaptive_fec_config.configure(g_fec_par, adaptive_normal_profile, adaptive_guard_profile, adaptive_degraded_profile) != 0) {
+            mylog(log_fatal, "failed to parse adaptive FEC profile\n");
+            myexit(-1);
+        }
+        g_adaptive_fec_config.enabled = 1;
     }
 
     print_parameter();

@@ -152,6 +152,7 @@ fec_encode_manager_t::fec_encode_manager_t() {
     /////reset_fec_parameter(g_fec_data_num,g_fec_redundant_num,g_fec_mtu,g_fec_queue_len,g_fec_timeout,g_fec_mode);
 
     fec_par.clone(g_fec_par);
+    has_pending_fec_update = 0;
     clear_data();
 }
 /*
@@ -203,7 +204,10 @@ int fec_encode_manager_t::append(char *s, int len /*,int &is_first_packet*/) {
     return 0;
 }
 int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
-    if (counter == 0 && fec_par.version != g_fec_par.version) {
+    if (counter == 0 && has_pending_fec_update) {
+        fec_par.clone(pending_fec_par);
+        has_pending_fec_update = 0;
+    } else if (counter == 0 && fec_par.version != g_fec_par.version) {
         fec_par.clone(g_fec_par);
     }
 
@@ -360,8 +364,17 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
                 // log_bare(log_warn,"")
             }
         }
-        // output_len=blob_len+sizeof(u32_t)+4*sizeof(char);/////remember to change this 4,if modified the protocol
-        rs_encode2(actual_data_num, actual_data_num + actual_redundant_num, tmp_output_buf, fec_len);
+        // A k=1 group is pure replication: all systematic and parity shards
+        // contain the same bytes.  Avoid the RS matrix lookup/allocation path
+        // and reuse the encoder's fixed input buffers directly.  This is a
+        // common adaptive-FEC guard/degraded shape for short packets.
+        if (actual_data_num == 1) {
+            for (int i = 1; i < actual_data_num + actual_redundant_num; i++) {
+                memcpy(tmp_output_buf[i], tmp_output_buf[0], fec_len);
+            }
+        } else {
+            rs_encode2(actual_data_num, actual_data_num + actual_redundant_num, tmp_output_buf, fec_len);
+        }
 
         if (0) {
             printf("seq=%u,fec_len=%d,%d %d,after fec\n", seq, fec_len, actual_data_num, actual_redundant_num);
@@ -515,20 +528,23 @@ int fec_decode_manager_t::input(char *s, int len) {
         return 0;
     }
 
-    if (mp[seq].fec_done != 0) {
+    fec_group_t &group = mp[seq];
+    if (group.first_seen_time == 0) group.first_seen_time = get_current_time_us();
+
+    if (group.fec_done != 0) {
         mylog(log_debug, "fec already done, ignore, seq=%u\n", seq);
         return -1;
     }
 
-    if (mp[seq].group_mp.find(inner_index) != mp[seq].group_mp.end()) {
+    if (group.group_mp.find(inner_index) != group.group_mp.end()) {
         mylog(log_debug, "dup fec index\n");  // duplicate can happen on  a normal network, so its just log_debug
         return -1;
     }
 
-    if (mp[seq].type == -1)
-        mp[seq].type = type;
+    if (group.type == -1)
+        group.type = type;
     else {
-        if (mp[seq].type != type) {
+        if (group.type != type) {
             mylog(log_warn, "type mismatch\n");
             return -1;
         }
@@ -537,12 +553,12 @@ int fec_decode_manager_t::input(char *s, int len) {
     if (data_num != 0) {
         // mp[seq].data_counter++;
 
-        if (mp[seq].data_num == -1) {
-            mp[seq].data_num = data_num;
-            mp[seq].redundant_num = redundant_num;
-            mp[seq].len = len;
+        if (group.data_num == -1) {
+            group.data_num = data_num;
+            group.redundant_num = redundant_num;
+            group.len = len;
         } else {
-            if (mp[seq].data_num != data_num || mp[seq].redundant_num != redundant_num || mp[seq].len != len) {
+            if (group.data_num != data_num || group.redundant_num != redundant_num || group.len != len) {
                 mylog(log_warn, "unexpected mp[seq].data_num!=data_num||mp[seq].redundant_num!=redundant_num||mp[seq].len!=len\n");
                 return -1;
             }
@@ -562,6 +578,7 @@ int fec_decode_manager_t::input(char *s, int len) {
             int cnt = tmp_it->second.group_mp.size();
 
             if (cnt < x) {
+                statistics.unrecoverable_packets += x;
                 if (debug_fec_dec)
                     mylog(log_debug, "[dec][failed]seq=%08x x=%d y=%d cnt=%d\n", tmp_seq, x, y, cnt);
                 else
@@ -585,7 +602,9 @@ int fec_decode_manager_t::input(char *s, int len) {
     assert(0 <= index && index < (int)fec_buff_num);
     assert(len + 100 < buf_len);
     memcpy(fec_data[index].buf, s + tmp_idx, len);
-    mp[seq].group_mp[inner_index] = index;
+    if (group.highest_inner_index >= 0 && inner_index < group.highest_inner_index) statistics.reordered_packets++;
+    if (inner_index > group.highest_inner_index) group.highest_inner_index = inner_index;
+    group.group_mp[inner_index] = index;
     // index++ at end of function
 
     map<int, int> &inner_mp = mp[seq].group_mp;
@@ -629,7 +648,13 @@ int fec_decode_manager_t::input(char *s, int len) {
                     y_got++;
                 fec_tmp_arr[it->first] = fec_data[it->second].buf;
             }
-            assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, fec_tmp_arr, len) == 0);  // the input data has been modified in-place
+            if (group_data_num == 1) {
+                // Any k=1 shard is the original blob.  Point at the retained
+                // receive buffer rather than constructing an RS decoder.
+                fec_tmp_arr[0] = fec_data[inner_mp.begin()->second].buf;
+            } else {
+                assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, fec_tmp_arr, len) == 0);  // the input data has been modified in-place
+            }
             // this line should always succeed
             mp[seq].fec_done = 1;
 
@@ -648,6 +673,8 @@ int fec_decode_manager_t::input(char *s, int len) {
                 anti_replay.set_invalid(seq);
                 goto end;
             }
+            statistics.delivered_packets += output_n;
+            if (group_data_num > x_got) statistics.recovered_packets += group_data_num - x_got;
             assert(ready_for_output == 0);
             ready_for_output = 1;
             anti_replay.set_invalid(seq);
@@ -707,7 +734,13 @@ int fec_decode_manager_t::input(char *s, int len) {
             }
             mylog(log_trace, "fec done,%d %d,missed_packet_counter=%d\n", group_data_num, group_redundant_num, missed_packet_counter);
 
-            assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, output_s_arr_buf, max_len) == 0);  // this should always succeed
+            if (group_data_num == 1) {
+                // The mode-1 wrapper is replicated too; reuse the retained
+                // shard rather than running the generic RS decoder.
+                output_s_arr_buf[0] = fec_data[inner_mp.begin()->second].buf;
+            } else {
+                assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, output_s_arr_buf, max_len) == 0);  // this should always succeed
+            }
             mp[seq].fec_done = 1;
 
             int sum_ori = 0;
@@ -735,6 +768,8 @@ int fec_decode_manager_t::input(char *s, int len) {
                 mylog(log_trace, "[dec]seq=%08x x=%d y=%d len=%d sum_ori=%d sum=%d X=%d Y=%d\n", seq, group_data_num, group_redundant_num, max_len, sum_ori, sum, x_got, y_got);
 
             if (fec_result_ok) {
+                statistics.delivered_packets += group_data_num;
+                if (group_data_num > x_got) statistics.recovered_packets += group_data_num - x_got;
                 output_n = group_data_num;
 
                 if (decode_fast_send) {
@@ -792,6 +827,23 @@ int fec_decode_manager_t::output(int &n, char **&s_arr, int *&len_arr) {
         n = output_n;
         s_arr = output_s_arr;
         len_arr = output_len_arr;
+    }
+    return 0;
+}
+
+int fec_decode_manager_t::expire_incomplete_groups(my_time_t maximum_age_us) {
+    if (maximum_age_us == 0) return 0;
+
+    my_time_t now = get_current_time_us();
+    for (auto it = mp.begin(); it != mp.end();) {
+        fec_group_t &group = it->second;
+        if (group.data_num > 0 && group.first_seen_time != 0 && now - group.first_seen_time >= maximum_age_us && (int)group.group_mp.size() < group.data_num) {
+            statistics.unrecoverable_packets += group.data_num;
+            anti_replay.set_invalid(it->first);
+            it = mp.erase(it);
+        } else {
+            ++it;
+        }
     }
     return 0;
 }

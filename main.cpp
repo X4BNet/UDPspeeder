@@ -63,6 +63,12 @@ static void print_help() {
     //    printf("    --fix-latency         <number>        try to stabilize latency, only for mode 0\n");
     printf("    --delay-capacity      <number>        max number of delayed packets, 0 means unlimited, default: 0\n");
     printf("    --disable-fec         <number>        completely disable fec, turn the program into a normal udp tunnel\n");
+    printf("    --adaptive-fec                        opt-in keyed receiver-feedback FEC state machine; both peers need the same 16+ byte -k\n");
+    printf("    --adaptive-normal     <x:y,...>       normal profile; default is zero redundancy and uses the direct bypass fast path\n");
+    printf("    --adaptive-guard      <x:y,...>       guard profile; default is one third of configured redundancy\n");
+    printf("    --adaptive-degraded   <x:y,...>       degraded profile; default is the configured --fec profile\n");
+    printf("    --adaptive-feedback-ms <number>       receiver feedback interval, 100..10000ms, default 500ms\n");
+    printf("    --adaptive-recover-ms <number>        clean-link hold before normal, 1000..60000ms, default 10000ms\n");
     printf("    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024\n");
     printf("    --out-addr            ip:port         force all output packets of '-r' end to go through this address, port 0 for random port.\n");
 #ifdef __linux__
