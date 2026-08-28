@@ -13,6 +13,8 @@ state, logs, and UDPspeeder batch counters.
 
 Options:
   --binary PATH             UDPspeeder binary (default: ./speederv2)
+  --client-binary PATH      client binary; defaults to --binary
+  --server-binary PATH      server binary; defaults to --binary
   --out DIR                 artifact directory (default: /tmp/udpspeeder-pps-<timestamp>)
   --profile NAME            nofec, fec11, fec14, or adaptive (default: nofec)
   --rate PPS                requested payload PPS (default: 50000)
@@ -32,6 +34,8 @@ EOF
 }
 
 binary=./speederv2
+client_binary=
+server_binary=
 out=
 profile=nofec
 rate=50000
@@ -51,6 +55,8 @@ receiver_cpu=4
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --binary) binary=$2; shift 2 ;;
+        --client-binary) client_binary=$2; shift 2 ;;
+        --server-binary) server_binary=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
         --profile) profile=$2; shift 2 ;;
         --rate) rate=$2; shift 2 ;;
@@ -77,6 +83,10 @@ fi
 
 binary=$(readlink -f "$binary")
 [[ -x "$binary" ]] || { echo "not executable: $binary" >&2; exit 2; }
+if [[ -z "$client_binary" ]]; then client_binary=$binary; else client_binary=$(readlink -f "$client_binary"); fi
+if [[ -z "$server_binary" ]]; then server_binary=$binary; else server_binary=$(readlink -f "$server_binary"); fi
+[[ -x "$client_binary" ]] || { echo "not executable: $client_binary" >&2; exit 2; }
+[[ -x "$server_binary" ]] || { echo "not executable: $server_binary" >&2; exit 2; }
 [[ "$receive_batch" =~ ^[0-9]+$ ]] && ((receive_batch >= 1 && receive_batch <= 64)) || { echo "invalid --recvmmsg-batch" >&2; exit 2; }
 for cpu in "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"; do
     [[ "$cpu" =~ ^[0-9]+$ ]] || { echo "--cpus needs five comma-separated CPU ids" >&2; exit 2; }
@@ -134,8 +144,8 @@ ip -n "$server_ns" link set "$server_veth" up
 {
     date -u +%FT%TZ
     uname -a
-    sha256sum "$binary"
-    "$binary" --help | sed -n '1,8p'
+    sha256sum "$client_binary" "$server_binary"
+    "$client_binary" --help | sed -n '1,8p'
     sysctl -n net.core.rmem_max net.core.wmem_max
     printf 'cpus=echo:%s server:%s client:%s sender:%s receiver:%s\n' "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"
 } >"$out/environment.txt"
@@ -191,9 +201,9 @@ run_case() {
     [[ $use_sendmmsg -eq 1 ]] && send_args+=(--sendmmsg)
 
     ip netns exec "$server_ns" taskset -c "$echo_cpu" "$out/bin/udp_echo" "$server_ip" 41000 >"$dir/echo.log" 2>&1 & echo_pid=$!
-    ip netns exec "$server_ns" taskset -c "$server_cpu" "$binary" -s -l"$server_ip":41001 -r"$server_ip":41000 \
+    ip netns exec "$server_ns" taskset -c "$server_cpu" "$server_binary" -s -l"$server_ip":41001 -r"$server_ip":41000 \
         "${fec_args[@]}" --sock-buf 10240 --recvmmsg-batch "$receive_batch" "${send_args[@]}" --report 1 --disable-color --log-level 4 >"$dir/server.log" 2>&1 & server_pid=$!
-    ip netns exec "$client_ns" taskset -c "$client_cpu" "$binary" -c -l"$client_ip":41002 -r"$server_ip":41001 \
+    ip netns exec "$client_ns" taskset -c "$client_cpu" "$client_binary" -c -l"$client_ip":41002 -r"$server_ip":41001 \
         "${fec_args[@]}" --sock-buf 10240 --recvmmsg-batch "$receive_batch" "${send_args[@]}" --report 1 --disable-color --log-level 4 >"$dir/client.log" 2>&1 & client_pid=$!
     sleep 1
 

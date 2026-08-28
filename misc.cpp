@@ -444,11 +444,46 @@ int unit_test() {
         assert(mode_one_encoder->input(mode_one_packet, (int)strlen(mode_one_packet)) == 0);
         assert(mode_one_encoder->output(encoded_count, encoded, encoded_lengths) == 0);
         assert(encoded_count == 5);
+
+        // The systematic k=1 frame now carries a full FEC header. A new
+        // decoder can forward it directly, then suppress its replicas.
+        assert((unsigned char)encoded[0][sizeof(u32_t) + sizeof(char)] == 1);
+        assert((unsigned char)encoded[0][sizeof(u32_t) + 2 * sizeof(char)] == 4);
+        assert(mode_one_decoder->input(encoded[0], encoded_lengths[0]) == 0);
+        assert(mode_one_decoder->output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == 1);
+        assert(decoded_lengths[0] == (int)strlen(mode_one_packet));
+        assert(memcmp(decoded[0], mode_one_packet, decoded_lengths[0]) == 0);
+        assert(mode_one_decoder->input(encoded[4], encoded_lengths[4]) == 0);
+        assert(mode_one_decoder->output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == -1);
+
+        // A parity-only arrival must still recover the same k=1 payload.
+        assert(mode_one_decoder->clear() == 0);
         assert(mode_one_decoder->input(encoded[4], encoded_lengths[4]) == 0);
         assert(mode_one_decoder->output(decoded_count, decoded, decoded_lengths) == 0);
         assert(decoded_count == 1);
         assert(decoded_lengths[0] == (int)strlen(mode_one_packet));
         assert(memcmp(decoded[0], mode_one_packet, decoded_lengths[0]) == 0);
+        fec_decode_stats_t recovery_stats;
+        assert(mode_one_decoder->take_statistics(recovery_stats) == 0);
+        assert(recovery_stats.delivered_packets == 1);
+        assert(recovery_stats.recovered_packets == 1);
+
+        // An old sender advertises the systematic frame with data_num=0.
+        // The new decoder must retain that generic group and suppress the
+        // later full-header parity rather than delivering the packet twice.
+        char old_systematic[buf_len];
+        memcpy(old_systematic, encoded[0], encoded_lengths[0]);
+        old_systematic[sizeof(u32_t) + sizeof(char)] = 0;
+        old_systematic[sizeof(u32_t) + 2 * sizeof(char)] = 0;
+        assert(mode_one_decoder->clear() == 0);
+        assert(mode_one_decoder->input(old_systematic, encoded_lengths[0]) == 0);
+        assert(mode_one_decoder->output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == 1);
+        assert(mode_one_decoder->input(encoded[4], encoded_lengths[4]) == 0);
+        assert(mode_one_decoder->output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == 0);
 
         delete mode_one_decoder;
         delete mode_one_encoder;

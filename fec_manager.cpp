@@ -327,8 +327,18 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
             tmp_idx += sizeof(u32_t);
             input_buf[i][tmp_idx++] = (unsigned char)fec_par.mode;
             if (fec_par.mode == 1 && i < actual_data_num) {
-                input_buf[i][tmp_idx++] = (unsigned char)0;
-                input_buf[i][tmp_idx++] = (unsigned char)0;
+                // A k=1 mode-1 group can be recovered from any one shard.
+                // Advertise its actual shape on the systematic frame so a
+                // new decoder can directly deliver it without allocating a
+                // group. Older decoders already accept this normal k=1 FEC
+                // header, so this stays wire compatible.
+                if (actual_data_num == 1) {
+                    input_buf[i][tmp_idx++] = (unsigned char)actual_data_num;
+                    input_buf[i][tmp_idx++] = (unsigned char)actual_redundant_num;
+                } else {
+                    input_buf[i][tmp_idx++] = (unsigned char)0;
+                    input_buf[i][tmp_idx++] = (unsigned char)0;
+                }
             } else {
                 input_buf[i][tmp_idx++] = (unsigned char)actual_data_num;
                 input_buf[i][tmp_idx++] = (unsigned char)actual_redundant_num;
@@ -525,6 +535,34 @@ int fec_decode_manager_t::input(char *s, int len) {
     }
     if (!anti_replay.is_valid(seq)) {
         mylog(log_trace, "!anti_replay.is_valid(seq) ,seq =%u\n", seq);
+        return 0;
+    }
+
+    // k=1 mode-1 frames are replication, not a generic RS group. A new
+    // encoder writes the full k=1 header on its systematic frame; every
+    // parity frame already has the same header. The payload is safe to pass
+    // directly because callers synchronously consume output before reusing
+    // their receive buffer. Marking the sequence invalid suppresses the
+    // remaining replicas, while a lost systematic frame is recovered by the
+    // first received parity frame. Older emitters use data_num==0 here and
+    // continue through the retained-copy generic path below.
+    if (type == 1 && data_num == 1 && inner_index < data_num + redundant_num &&
+        (inner_index == 0 || mp.find(seq) == mp.end())) {
+        int direct_len = (int)read_u16(s + tmp_idx);
+        if (direct_len != len - (int)sizeof(u16_t) || direct_len > max_data_len) {
+            mylog(log_warn, "invalid k=1 replicated frame len=%d payload_len=%d\n", len, direct_len);
+            return -1;
+        }
+        assert(ready_for_output == 0);
+        output_n = 1;
+        output_s_arr_buf[0] = s + tmp_idx + sizeof(u16_t);
+        output_len_arr_buf[0] = direct_len;
+        output_s_arr = output_s_arr_buf;
+        output_len_arr = output_len_arr_buf;
+        ready_for_output = 1;
+        statistics.delivered_packets++;
+        if (inner_index != 0) statistics.recovered_packets++;
+        anti_replay.set_invalid(seq);
         return 0;
     }
 

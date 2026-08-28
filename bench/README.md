@@ -25,3 +25,6 @@ seconds, socket drops, interface and qdisc counters, logs, and I/O batch
 counters. The harness applies netem only to its disposable namespace veths.
 Use a five-core set that is otherwise idle on shared runners; its exact CPU
 mapping is written to `environment.txt`.
+
+Use `--client-binary` and `--server-binary` to verify a wire-compatible change
+against an older peer. Each artifact records both binary hashes.
