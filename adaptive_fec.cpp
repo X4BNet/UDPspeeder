@@ -404,9 +404,12 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         if (!peer_capable) {
             peer_capable = 1;
             profile_dirty = 1;
+            // Reply exactly once to a newly discovered peer. Re-acknowledging
+            // every compatible legacy probe creates an idle control ping-pong
+            // and adds an avoidable packet beside each direct-bypass payload.
+            hello_response_pending = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
-        hello_response_pending = 1;
         return adaptive_fec_consumed;
     }
 
@@ -422,9 +425,9 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         if (!peer_capable) {
             peer_capable = 1;
             profile_dirty = 1;
+            hello_response_pending = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
-        hello_response_pending = 1;
         return adaptive_fec_consumed;
     }
     if (kind == adaptive_fec_feedback) {
@@ -505,6 +508,12 @@ int adaptive_fec_unit_test() {
     assert(receiver.build_pending_control(control, control_len) == 1);
     assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
     assert(sender.can_bypass());
+    // The initiator may send one acknowledgement for the responder's first
+    // capability probe. The responder must not acknowledge that acknowledgement
+    // forever.
+    assert(sender.build_pending_control(control, control_len) == 1);
+    assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
+    assert(receiver.build_pending_control(control, control_len) == 0);
 
     char test_payload[] = "adaptive-fec-bypass";
     assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);

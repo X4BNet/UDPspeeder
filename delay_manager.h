@@ -136,6 +136,9 @@ struct delay_manager_t {
     ev_timer &get_timer();
     int check();
     int add(my_time_t delay, const dest_t &dest, char *data, int len);
+    int add_batch(const my_time_t *delay, const dest_t &dest, char *const *data, const int *len, int n);
 };
+
+extern int use_sendmmsg;
 
 #endif /* DELAY_MANAGER_H_ */

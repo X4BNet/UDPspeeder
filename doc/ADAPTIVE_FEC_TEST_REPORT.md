@@ -1,7 +1,7 @@
 # Adaptive FEC and direct-bypass qualification
 
 Date: 2026-08-28 (UTC)  
-Fork base: `b6a1b5941d9ebb6ef4f6866abdf1e03a47b99b2d`
+Fork base: `64091e971e335f436927e1b834e79ee63e83e747`
 
 ## Scope
 
@@ -54,6 +54,10 @@ not yet been sent.
   through impairment and recovery; the client logged
   `normal -> degraded -> recover -> normal` and resumed direct bypass. The
   recovery phase delivered 640 echo responses.
+* Capability probes now receive at most one acknowledgement from a newly
+  discovered peer. A trace with 100 ms control timing produced one initial
+  data-plus-ack batch, then direct payloads and idle timers each produced at
+  most one packet rather than an unbounded hello ping-pong.
 
 ## Normal-load small-packet result
 
@@ -110,3 +114,45 @@ interoperation with the stock decoder. Keep the fast path for its simpler
 correct k=1 handling and removal of generic RS work, but do not promote it as
 a demonstrated end-to-end PPS gain until repeated affinity-pinned 50/100
 Mbit/s tests show a repeatable CPU or tail-latency improvement.
+
+## `sendmmsg` high-PPS qualification
+
+The Linux-only `--sendmmsg` candidate batches only packets already ready for
+one destination. It batches an immediate FEC output group from one encoder
+call, and batches delay-manager packets only when their scheduled deadlines
+have elapsed together. It does not queue a direct-bypass packet waiting for a
+batch. Any partial `sendmmsg` result sends its unsent tail through the existing
+prepared single-send path.
+
+Functional checks confirmed both aggregation paths:
+
+* Static `-f1:4 --mode 1` delivered 120/120 echo payloads. `strace` recorded
+  120 outbound `sendmmsg` calls rather than five single sends per FEC group.
+* Delayed mode-0 `-q1 --timeout 20 --fix-latency` delivered 1/1; after its
+  common delay elapsed, the five-shard group was emitted as one `sendmmsg`.
+* A Debug ASAN/UBSAN build completed its unit suite and the static sendmmsg
+  echo check without sanitizer findings.
+
+The affinity-separated stress test used 512-byte payloads paced at 50,000 PPS
+for ten seconds (about 203 Mbit/s useful payload in each direction). Static
+`-f1:4 --mode 1` produces five wire datagrams per payload, so this exercises an
+approximately 250,000-PPS FEC send path in each direction.
+
+| Metric | Individual sends | `--sendmmsg` |
+| --- | ---: | ---: |
+| Sent payloads | 496,264 | 495,920 |
+| Delivered payloads | 47,849 | 49,437 |
+| Successful payloads | 9.642% | 9.969% |
+| Raw p50 | 1,598.733 ms | 1,498.785 ms |
+| Raw p95 | 1,720.293 ms | 1,591.582 ms |
+| Raw p99 | 1,743.895 ms | 1,606.965 ms |
+| Client speeder CPU ticks | 1,096 | 1,083 |
+| Server speeder CPU ticks | 1,106 | 1,091 |
+
+This is a positive but not rollout-quality result: `sendmmsg` improved loaded
+p99 by 137 ms and reduced measured speeder CPU by about 1.2%, but both runs
+lost most payloads. A 50,000-PPS adaptive direct-bypass control (one wire
+datagram per payload) reached 35.659% success with 815.970 ms p99, confirming
+that receive/event-loop handling and FEC packet expansion, not transmit syscall
+count alone, are the dominant ceiling. The next experiment is an opt-in
+`recvmmsg` receive-draining path before considering an io_uring reactor.

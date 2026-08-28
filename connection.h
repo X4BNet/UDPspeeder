@@ -17,6 +17,7 @@ extern int disable_anti_replay;
 #include "fd_manager.h"
 #include "fec_manager.h"
 #include "adaptive_fec.h"
+#include "receive_batch.h"
 
 extern int report_interval;
 
@@ -202,6 +203,7 @@ struct stat_t {
             mylog(log_info, "[report]client-->server:(original:%llu pkt;%llu byte) (fec:%llu pkt,%llu byte)  server-->client:(original:%llu pkt;%llu byte) (fec:%llu pkt;%llu byte)\n",
                   a.input_packet_num, a.input_packet_size, a.output_packet_num, a.output_packet_size,
                   b.output_packet_num, b.output_packet_size, b.input_packet_num, b.input_packet_size);
+            report_io_batch_statistics("client");
         }
     }
     void report_as_server(address_t &addr) {
@@ -213,6 +215,7 @@ struct stat_t {
                   addr.get_str(),
                   a.output_packet_num, a.output_packet_size, a.input_packet_num, a.input_packet_size,
                   b.input_packet_num, b.input_packet_size, b.output_packet_num, b.output_packet_size);
+            report_io_batch_statistics("server");
         }
     }
 };

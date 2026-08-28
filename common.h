@@ -7,6 +7,9 @@
 
 #ifndef COMMON_H_
 #define COMMON_H_
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 //#define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
 

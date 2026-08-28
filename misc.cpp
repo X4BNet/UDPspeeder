@@ -40,6 +40,8 @@ int time_mono_test = 0;
 
 int delay_capacity = 0;
 
+int use_sendmmsg = 0;
+
 char sub_net[100] = "10.22.22.0";
 u32_t sub_net_uint32 = 0;
 
@@ -286,11 +288,31 @@ int delay_send(my_time_t delay, const dest_t &dest, char *data, int len) {
     ;
 }
 
+int delay_send_batch(const dest_t &dest, char *const *data, const int *len, const my_time_t *delay, int n) {
+    if (n <= 0) return 0;
+    if (n == 1) return delay_send(delay[0], dest, data[0], len[0]);
+
+    char *kept_data[max_fec_packet_num + 100];
+    int kept_len[max_fec_packet_num + 100];
+    my_time_t kept_delay[max_fec_packet_num + 100];
+    int kept_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (dest.cook && random_drop != 0 && get_fake_random_number() % 10000 < (u32_t)random_drop) continue;
+        kept_data[kept_n] = data[i];
+        kept_len[kept_n] = len[i];
+        kept_delay[kept_n] = delay[i];
+        kept_n++;
+    }
+    return delay_manager.add_batch(kept_delay, dest, kept_data, kept_len, kept_n);
+}
+
 int print_parameter() {
     mylog(log_info, "jitter_min=%d jitter_max=%d output_interval_min=%d output_interval_max=%d fec_timeout=%d fec_mtu=%d fec_queue_len=%d fec_mode=%d\n",
           jitter_min / 1000, jitter_max / 1000, output_interval_min / 1000, output_interval_max / 1000, g_fec_par.timeout / 1000, g_fec_par.mtu, g_fec_par.queue_len, g_fec_par.mode);
     mylog(log_info, "fec_str=%s\n", rs_par_str);
     mylog(log_info, "fec_inner_parameter=%s\n", g_fec_par.rs_to_str());
+    mylog(log_info, "sendmmsg=%s\n", use_sendmmsg ? "enabled" : "disabled");
+    mylog(log_info, "recvmmsg_batch=%d\n", get_receive_batch_size());
     if (g_adaptive_fec_config.enabled) {
         mylog(log_info, "adaptive_fec enabled: feedback_ms=%d recover_hold_ms=%d min_samples=%d\n",
               g_adaptive_fec_config.feedback_interval_us / 1000, g_adaptive_fec_config.recover_hold_us / 1000, g_adaptive_fec_config.minimum_samples);
@@ -377,6 +399,7 @@ static void empty_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents
 }
 int unit_test() {
     assert(adaptive_fec_unit_test() == 0);
+    assert(receive_batch_unit_test() == 0);
 
     // Exercise the encoder/decoder k=1 replication fast path, including
     // recovery from a parity-only mode-0 group and a mode-1 group.  The
@@ -389,42 +412,48 @@ int unit_test() {
         g_fec_par.version++;
         g_fec_par.mode = 0;
 
-        fec_encode_manager_t encoder;
-        fec_decode_manager_t decoder;
-        encoder.set_loop_and_cb(ev_default_loop(0), empty_cb);
+        fec_encode_manager_t *encoder = new fec_encode_manager_t;
+        fec_decode_manager_t *decoder = new fec_decode_manager_t;
+        assert(encoder != 0 && decoder != 0);
+        encoder->set_loop_and_cb(ev_default_loop(0), empty_cb);
         char packet[] = "k1-replication-mode-zero";
-        assert(encoder.input(packet, (int)strlen(packet)) == 0);
-        assert(encoder.input(0, 0) == 0);
+        assert(encoder->input(packet, (int)strlen(packet)) == 0);
+        assert(encoder->input(0, 0) == 0);
 
         int encoded_count;
         char **encoded;
         int *encoded_lengths;
-        assert(encoder.output(encoded_count, encoded, encoded_lengths) == 0);
+        assert(encoder->output(encoded_count, encoded, encoded_lengths) == 0);
         assert(encoded_count == 5);
-        assert(decoder.input(encoded[4], encoded_lengths[4]) == 0);
+        assert(decoder->input(encoded[4], encoded_lengths[4]) == 0);
 
         int decoded_count;
         char **decoded;
         int *decoded_lengths;
-        assert(decoder.output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoder->output(decoded_count, decoded, decoded_lengths) == 0);
         assert(decoded_count == 1);
         assert(decoded_lengths[0] == (int)strlen(packet));
         assert(memcmp(decoded[0], packet, decoded_lengths[0]) == 0);
 
         g_fec_par.mode = 1;
-        fec_encode_manager_t mode_one_encoder;
-        fec_decode_manager_t mode_one_decoder;
-        mode_one_encoder.set_loop_and_cb(ev_default_loop(0), empty_cb);
+        fec_encode_manager_t *mode_one_encoder = new fec_encode_manager_t;
+        fec_decode_manager_t *mode_one_decoder = new fec_decode_manager_t;
+        assert(mode_one_encoder != 0 && mode_one_decoder != 0);
+        mode_one_encoder->set_loop_and_cb(ev_default_loop(0), empty_cb);
         char mode_one_packet[] = "k1-replication-mode-one";
-        assert(mode_one_encoder.input(mode_one_packet, (int)strlen(mode_one_packet)) == 0);
-        assert(mode_one_encoder.output(encoded_count, encoded, encoded_lengths) == 0);
+        assert(mode_one_encoder->input(mode_one_packet, (int)strlen(mode_one_packet)) == 0);
+        assert(mode_one_encoder->output(encoded_count, encoded, encoded_lengths) == 0);
         assert(encoded_count == 5);
-        assert(mode_one_decoder.input(encoded[4], encoded_lengths[4]) == 0);
-        assert(mode_one_decoder.output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(mode_one_decoder->input(encoded[4], encoded_lengths[4]) == 0);
+        assert(mode_one_decoder->output(decoded_count, decoded, decoded_lengths) == 0);
         assert(decoded_count == 1);
         assert(decoded_lengths[0] == (int)strlen(mode_one_packet));
         assert(memcmp(decoded[0], mode_one_packet, decoded_lengths[0]) == 0);
 
+        delete mode_one_decoder;
+        delete mode_one_encoder;
+        delete decoder;
+        delete encoder;
         g_fec_par = saved_fec;
     }
     {
@@ -715,6 +744,8 @@ void process_arg(int argc, char *argv[]) {
             {"adaptive-degraded", required_argument, 0, 1},
             {"adaptive-feedback-ms", required_argument, 0, 1},
             {"adaptive-recover-ms", required_argument, 0, 1},
+            {"sendmmsg", no_argument, 0, 1},
+            {"recvmmsg-batch", required_argument, 0, 1},
             {"interval", required_argument, 0, 'i'},
             {NULL, 0, 0, 0}};
     int option_index = 0;
@@ -1017,6 +1048,25 @@ void process_arg(int argc, char *argv[]) {
                         myexit(-1);
                     }
                     g_adaptive_fec_config.recover_hold_us = milliseconds * 1000;
+                } else if (strcmp(long_options[option_index].name, "sendmmsg") == 0) {
+#if defined(__linux__)
+                    use_sendmmsg = 1;
+#else
+                    mylog(log_fatal, "--sendmmsg is only supported on Linux\n");
+                    myexit(-1);
+#endif
+                } else if (strcmp(long_options[option_index].name, "recvmmsg-batch") == 0) {
+                    sscanf(optarg, "%d", &recvmmsg_batch);
+                    if (recvmmsg_batch < 1 || recvmmsg_batch > max_receive_batch) {
+                        mylog(log_fatal, "recvmmsg-batch must be between 1 and %d\n", max_receive_batch);
+                        myexit(-1);
+                    }
+#if !defined(__linux__)
+                    if (recvmmsg_batch > 1) {
+                        mylog(log_warn, "recvmmsg is unavailable on this platform; using one receive per callback\n");
+                        recvmmsg_batch = 1;
+                    }
+#endif
                 } else {
                     mylog(log_fatal, "unknown option\n");
                     myexit(-1);

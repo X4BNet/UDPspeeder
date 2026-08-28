@@ -167,6 +167,10 @@ int my_send(const dest_t &dest, char *data, int len) {
     if (dest.cook) {
         do_cook(data, len);
     }
+    return my_send_prepared(dest, data, len);
+}
+
+int my_send_prepared(const dest_t &dest, char *data, int len) {
     switch (dest.type) {
         case type_fd_addr: {
             return sendto_fd_addr(dest.inner.fd, dest.inner.fd_addr.addr, data, len, 0);

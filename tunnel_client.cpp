@@ -1,12 +1,21 @@
 #include "tunnel.h"
 
-void data_from_local_or_fec_timeout(conn_info_t &conn_info, int is_time_out) {
-    fd64_t &remote_fd64 = conn_info.remote_fd64;
-    int &local_listen_fd = conn_info.local_listen_fd;
+namespace {
 
-    char data[buf_len];
-    int data_len;
-    address_t addr;
+// The client has only one local and one remote socket.  Keeping their receive
+// storage separate avoids heap allocation and keeps a returned packet valid
+// until its synchronous processing completes.
+udp_receive_batch_t local_receive_batch;
+udp_receive_batch_t remote_receive_batch;
+
+int receive_event_limit() {
+    return get_receive_batch_size() > 1 ? max_receive_packets_per_callback : 1;
+}
+
+}  // namespace
+
+static void process_local_datagram(conn_info_t &conn_info, char *data, int data_len, address_t addr) {
+    fd64_t &remote_fd64 = conn_info.remote_fd64;
     u32_t conv;
     int out_n;
     char **out_arr;
@@ -17,121 +26,83 @@ void data_from_local_or_fec_timeout(conn_info_t &conn_info, int is_time_out) {
     dest.inner.fd64 = remote_fd64;
     dest.cook = 1;
 
-    if (is_time_out) {
-        // fd64_t fd64=events[idx].data.u64;
-        mylog(log_trace, "events[idx].data.u64 == conn_info.fec_encode_manager.get_timer_fd64()\n");
-
-        // uint64_t value;
-        // if(!fd_manager.exist(fd64))   //fd64 has been closed
-        //{
-        //	mylog(log_trace,"!fd_manager.exist(fd64)");
-        //	continue;
-        // }
-        // if((ret=read(fd_manager.to_fd(fd64), &value, 8))!=8)
-        //{
-        //	mylog(log_trace,"(ret=read(fd_manager.to_fd(fd64), &value, 8))!=8,ret=%d\n",ret);
-        //	continue;
-        // }
-        // if(value==0)
-        //{
-        //	mylog(log_debug,"value==0\n");
-        //	continue;
-        // }
-        // assert(value==1);
-        from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
-    } else  // events[idx].data.u64 == (u64_t)local_listen_fd
-    {
-        mylog(log_trace, "events[idx].data.u64 == (u64_t)local_listen_fd\n");
-        address_t::storage_t udp_new_addr_in = {0};
-        socklen_t udp_new_addr_len = sizeof(address_t::storage_t);
-        if ((data_len = recvfrom(local_listen_fd, data, max_data_len + 1, 0,
-                                 (struct sockaddr *)&udp_new_addr_in, &udp_new_addr_len)) == -1) {
-            mylog(log_debug, "recv_from error,this shouldn't happen,err=%s,but we can try to continue\n", get_sock_error());
-            return;
-        };
-
-        if (data_len == max_data_len + 1) {
-            mylog(log_warn, "huge packet from upper level, data_len > %d, packet truncated, dropped\n", max_data_len);
-            return;
-        }
-
-        if (!disable_mtu_warn && data_len >= mtu_warn) {
-            mylog(log_warn, "huge packet,data len=%d (>=%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ", data_len, mtu_warn);
-        }
-
-        addr.from_sockaddr((struct sockaddr *)&udp_new_addr_in, udp_new_addr_len);
-
-        mylog(log_trace, "Received packet from %s, len: %d\n", addr.get_str(), data_len);
-
-        // u64_t u64=ip_port.to_u64();
-
-        if (!conn_info.conv_manager.c.is_data_used(addr)) {
-            if (conn_info.conv_manager.c.get_size() >= max_conv_num) {
-                mylog(log_warn, "ignored new udp connect bc max_conv_num exceed\n");
-                return;
-            }
-            conv = conn_info.conv_manager.c.get_new_conv();
-            conn_info.conv_manager.c.insert_conv(conv, addr);
-            mylog(log_info, "new packet from %s,conv_id=%x\n", addr.get_str(), conv);
-        } else {
-            conv = conn_info.conv_manager.c.find_conv_by_data(addr);
-            mylog(log_trace, "conv=%d\n", conv);
-        }
-        conn_info.conv_manager.c.update_active_time(conv);
-        char *new_data;
-        int new_len;
-        put_conv(conv, data, data_len, new_data, new_len);
-
-        mylog(log_trace, "data_len=%d new_len=%d\n", data_len, new_len);
-        from_normal_to_fec(conn_info, new_data, new_len, out_n, out_arr, out_len, out_delay);
+    if (data_len == max_data_len + 1) {
+        mylog(log_warn, "huge packet from upper level, data_len > %d, packet truncated, dropped\n", max_data_len);
+        return;
     }
+
+    if (!disable_mtu_warn && data_len >= mtu_warn) {
+        mylog(log_warn, "huge packet,data len=%d (>=%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ", data_len, mtu_warn);
+    }
+
+    mylog(log_trace, "Received packet from %s, len: %d\n", addr.get_str(), data_len);
+
+    if (!conn_info.conv_manager.c.is_data_used(addr)) {
+        if (conn_info.conv_manager.c.get_size() >= max_conv_num) {
+            mylog(log_warn, "ignored new udp connect bc max_conv_num exceed\n");
+            return;
+        }
+        conv = conn_info.conv_manager.c.get_new_conv();
+        conn_info.conv_manager.c.insert_conv(conv, addr);
+        mylog(log_info, "new packet from %s,conv_id=%x\n", addr.get_str(), conv);
+    } else {
+        conv = conn_info.conv_manager.c.find_conv_by_data(addr);
+        mylog(log_trace, "conv=%d\n", conv);
+    }
+    conn_info.conv_manager.c.update_active_time(conv);
+    char *new_data;
+    int new_len;
+    put_conv(conv, data, data_len, new_data, new_len);
+
+    mylog(log_trace, "data_len=%d new_len=%d\n", data_len, new_len);
+    from_normal_to_fec(conn_info, new_data, new_len, out_n, out_arr, out_len, out_delay);
     mylog(log_trace, "out_n=%d\n", out_n);
-    for (int i = 0; i < out_n; i++) {
-        delay_send(out_delay[i], dest, out_arr[i], out_len[i]);
-    }
+    delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
 }
+
+static void data_from_fec_timeout(conn_info_t &conn_info) {
+    int out_n;
+    char **out_arr;
+    int *out_len;
+    my_time_t *out_delay;
+    dest_t dest;
+    dest.type = type_fd64;
+    dest.inner.fd64 = conn_info.remote_fd64;
+    dest.cook = 1;
+    from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
+    delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
+}
+
 static void local_listen_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     assert(!(revents & EV_ERROR));
 
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
-
-    data_from_local_or_fec_timeout(conn_info, 0);
+    int processed = 0;
+    int event_limit = receive_event_limit();
+    while (processed < event_limit) {
+        int requested = min(get_receive_batch_size(), event_limit - processed);
+        int received = local_receive_batch.receive(watcher->fd, 1, requested);
+        if (received < 0) {
+            mylog(log_warn, "recv_from failed,err=%s\n", get_sock_error());
+            return;
+        }
+        if (received == 0) return;
+        for (int i = 0; i < received; i++) {
+            address_t addr;
+            addr.from_sockaddr((sockaddr *)&local_receive_batch.packets[i].address, local_receive_batch.packets[i].address_len);
+            process_local_datagram(conn_info, local_receive_batch.packets[i].data, local_receive_batch.packets[i].len, addr);
+        }
+        processed += received;
+        if (received < requested) return;
+    }
 }
 
-static void remote_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    assert(!(revents & EV_ERROR));
-
-    conn_info_t &conn_info = *((conn_info_t *)watcher->data);
-
-    char data[buf_len];
-    if (!fd_manager.exist(watcher->u64))  // fd64 has been closed
-    {
-        mylog(log_trace, "!fd_manager.exist(events[idx].data.u64)");
-        return;
-    }
-    fd64_t &remote_fd64 = conn_info.remote_fd64;
-    int &remote_fd = conn_info.remote_fd;
-
-    assert(watcher->u64 == remote_fd64);
-
-    int fd = fd_manager.to_fd(remote_fd64);
-
-    int data_len = recv(fd, data, max_data_len + 1, 0);
-
+static void process_remote_datagram(conn_info_t &conn_info, char *data, int data_len) {
     if (data_len == max_data_len + 1) {
         mylog(log_warn, "huge packet, data_len > %d, packet truncated, dropped\n", max_data_len);
         return;
     }
 
-    mylog(log_trace, "received data from udp fd %d, len=%d\n", remote_fd, data_len);
-    if (data_len < 0) {
-        if (get_sock_errno() == ECONNREFUSED) {
-            mylog(log_debug, "recv failed %d ,udp_fd%d,errno:%s\n", data_len, remote_fd, get_sock_error());
-        }
-
-        mylog(log_warn, "recv failed %d ,udp_fd%d,errno:%s\n", data_len, remote_fd, get_sock_error());
-        return;
-    }
     if (!disable_mtu_warn && data_len > mtu_warn) {
         mylog(log_warn, "huge packet,data len=%d (>%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ", data_len, mtu_warn);
     }
@@ -174,6 +145,34 @@ static void remote_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
     }
 }
 
+static void remote_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+    assert(!(revents & EV_ERROR));
+
+    conn_info_t &conn_info = *((conn_info_t *)watcher->data);
+    if (!fd_manager.exist(watcher->u64)) {
+        mylog(log_trace, "!fd_manager.exist(events[idx].data.u64)");
+        return;
+    }
+    assert(watcher->u64 == conn_info.remote_fd64);
+
+    int processed = 0;
+    int event_limit = receive_event_limit();
+    while (processed < event_limit) {
+        int requested = min(get_receive_batch_size(), event_limit - processed);
+        int received = remote_receive_batch.receive(fd_manager.to_fd(watcher->u64), 0, requested);
+        if (received < 0) {
+            mylog(log_warn, "recv failed,err=%s\n", get_sock_error());
+            return;
+        }
+        if (received == 0) return;
+        for (int i = 0; i < received; i++) {
+            process_remote_datagram(conn_info, remote_receive_batch.packets[i].data, remote_receive_batch.packets[i].len);
+        }
+        processed += received;
+        if (received < requested) return;
+    }
+}
+
 static void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     assert(!(revents & EV_ERROR));
     int fifo_fd = watcher->fd;
@@ -203,7 +202,7 @@ static void fec_encode_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
 
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
 
-    data_from_local_or_fec_timeout(conn_info, 1);
+    data_from_fec_timeout(conn_info);
 }
 
 static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
@@ -229,9 +228,7 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
         dest.inner.fd64 = conn_info.remote_fd64;
         dest.cook = 1;
         from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
-        for (int i = 0; i < out_n; i++) {
-            delay_send(out_delay[i], dest, out_arr[i], out_len[i]);
-        }
+        delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
     }
 }
 

@@ -13,6 +13,7 @@
 #include "fd_manager.h"
 #include "delay_manager.h"
 #include "fec_manager.h"
+#include "receive_batch.h"
 
 extern char fifo_file[1000];
 
@@ -62,6 +63,7 @@ int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, 
 int from_fec_to_normal(conn_info_t &conn_info, char *data, int len, int &out_n, char **&out_arr, int *&out_len, my_time_t *&out_delay);
 
 int delay_send(my_time_t delay, const dest_t &dest, char *data, int len);
+int delay_send_batch(const dest_t &dest, char *const *data, const int *len, const my_time_t *delay, int n);
 int print_parameter();
 int handle_command(char *s);
 

@@ -130,6 +130,8 @@ developer options:
     --adaptive-degraded   <x:y,...>       degraded profile; default is the configured --fec profile
     --adaptive-feedback-ms <number>       receiver feedback interval, 100..10000ms, default 500ms
     --adaptive-recover-ms <number>        clean-link hold before normal, 1000..60000ms, default 10000ms
+    --sendmmsg                            Linux opt-in: batch ready same-destination FEC and delayed packets
+    --recvmmsg-batch      <number>        Linux opt-in: receive up to this many UDP datagrams per syscall; 1 keeps legacy behavior
     --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024
 log and help options:
     --log-level           <number>        0: never    1: fatal   2: error   3: warn 
@@ -171,6 +173,34 @@ as valid legacy zero-payload FEC groups, so an older peer harmlessly consumes
 them. A peer that does not answer the bounded probes remains on the original
 static FEC profile; do not enable this option against an unchanged relay such
 as Amsterdam.
+
+#### `--sendmmsg` option
+
+`--sendmmsg` is an opt-in Linux send-path backend. It batches packets that are
+already ready for the same destination: FEC output groups are sent immediately
+as one batch, while packets that have elapsed in the delay manager are batched
+only when they become due together. A partial batch falls back to the existing
+single-send path for its unsent tail. It never holds a direct-bypass packet to
+fill a batch, so the option does not trade normal-path latency for throughput.
+
+Use it only after measuring the actual packet rate. It reduces system calls for
+FEC bursts but cannot by itself fix a receive-side packet-rate ceiling; pair
+qualification with raw RTT, drops, and CPU measurements.
+
+#### `--recvmmsg-batch` option
+
+`--recvmmsg-batch <1..64>` is an opt-in Linux receive-path backend. It
+preallocates message headers, I/O vectors, source addresses, and datagram
+buffers, then drains ready UDP datagrams in order with `recvmmsg`. Each libev
+read turn handles at most 128 datagrams to retain timer and socket fairness.
+The default is `1`, which keeps the original single-`recv`/`recvfrom` path.
+
+If the kernel reports `ENOSYS`, UDPspeeder logs the condition and automatically
+switches the process back to the legacy path. It is intentionally not the
+default: promote a batch size only after the PPS qualification records no
+socket drops and no tail-latency regression for the relevant packet sizes and
+loss stages. The batch report emitted by `--report` includes receive calls,
+datagrams, `EAGAIN`, fallback, and the existing send-batch counters.
 
 #### `--fifo` option
 Use a fifo(named pipe) for sending commands to the running program. For example `--fifo fifo.file`, you can use following commands to change parameters dynamically:

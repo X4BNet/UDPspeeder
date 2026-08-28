@@ -7,6 +7,149 @@
 #include "delay_manager.h"
 #include "log.h"
 #include "packet.h"
+#include "receive_batch.h"
+
+namespace {
+
+const int max_send_batch = 355;
+char immediate_batch_buffer[max_send_batch][buf_len];
+
+socklen_t address_length(const address_t &address) {
+    switch (((const sockaddr *)&address.inner)->sa_family) {
+        case AF_INET:
+            return sizeof(sockaddr_in);
+        case AF_INET6:
+            return sizeof(sockaddr_in6);
+        default:
+            assert(0 == 1);
+            return 0;
+    }
+}
+
+int same_dest(const dest_t &a, const dest_t &b) {
+    if (a.type != b.type || a.cook != b.cook) return 0;
+    switch (a.type) {
+        case type_fd64:
+            return a.inner.fd64 == b.inner.fd64;
+        case type_fd:
+        case type_write_fd:
+            return a.inner.fd == b.inner.fd;
+        case type_fd64_addr:
+            return a.inner.fd64_addr.fd64 == b.inner.fd64_addr.fd64 &&
+                   address_length(a.inner.fd64_addr.addr) == address_length(b.inner.fd64_addr.addr) &&
+                   memcmp(&a.inner.fd64_addr.addr.inner, &b.inner.fd64_addr.addr.inner, address_length(a.inner.fd64_addr.addr)) == 0;
+        case type_fd_addr:
+            return a.inner.fd_addr.fd == b.inner.fd_addr.fd &&
+                   address_length(a.inner.fd_addr.addr) == address_length(b.inner.fd_addr.addr) &&
+                   memcmp(&a.inner.fd_addr.addr.inner, &b.inner.fd_addr.addr.inner, address_length(a.inner.fd_addr.addr)) == 0;
+        default:
+            return 0;
+    }
+}
+
+int get_sendmmsg_destination(const dest_t &dest, int &fd, sockaddr *&address, socklen_t &address_len) {
+    address = 0;
+    address_len = 0;
+    switch (dest.type) {
+        case type_fd64:
+            if (!fd_manager.exist(dest.inner.fd64)) return -1;
+            fd = fd_manager.to_fd(dest.inner.fd64);
+            return 0;
+        case type_fd:
+            fd = dest.inner.fd;
+            return 0;
+        case type_fd64_addr:
+            if (!fd_manager.exist(dest.inner.fd64_addr.fd64)) return -1;
+            fd = fd_manager.to_fd(dest.inner.fd64_addr.fd64);
+            address = (sockaddr *)&dest.inner.fd64_addr.addr.inner;
+            address_len = address_length(dest.inner.fd64_addr.addr);
+            return 0;
+        case type_fd_addr:
+            fd = dest.inner.fd_addr.fd;
+            address = (sockaddr *)&dest.inner.fd_addr.addr.inner;
+            address_len = address_length(dest.inner.fd_addr.addr);
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+int send_prepared_batch(const dest_t &dest, char *const *data, const int *len, int n) {
+    if (n <= 0) return 0;
+    if (!use_sendmmsg || n == 1) {
+        int result = 0;
+        for (int i = 0; i < n; i++) {
+            if (my_send_prepared(dest, data[i], len[i]) < 0) result = -1;
+        }
+        return result;
+    }
+
+#if defined(__linux__)
+    int fd = -1;
+    sockaddr *address = 0;
+    socklen_t address_len = 0;
+    if (get_sendmmsg_destination(dest, fd, address, address_len) == 0) {
+        mmsghdr messages[max_send_batch];
+        iovec iovecs[max_send_batch];
+        assert(n <= max_send_batch);
+        for (int i = 0; i < n; i++) {
+            memset(&messages[i], 0, sizeof(messages[i]));
+            iovecs[i].iov_base = data[i];
+            iovecs[i].iov_len = len[i];
+            messages[i].msg_hdr.msg_iov = &iovecs[i];
+            messages[i].msg_hdr.msg_iovlen = 1;
+            messages[i].msg_hdr.msg_name = address;
+            messages[i].msg_hdr.msg_namelen = address_len;
+        }
+
+        int sent = sendmmsg(fd, messages, n, 0);
+        io_batch_statistics.sendmmsg_calls++;
+        if (sent < 0) {
+            if (get_sock_errno() == EAGAIN || get_sock_errno() == EWOULDBLOCK) {
+                io_batch_statistics.sendmmsg_eagain++;
+            }
+            sent = 0;
+        } else {
+            io_batch_statistics.sendmmsg_packets += sent;
+            if (sent < n) io_batch_statistics.sendmmsg_partial_calls++;
+        }
+        int result = 0;
+        for (int i = sent; i < n; i++) {
+            io_batch_statistics.sendmmsg_fallback_packets++;
+            if (my_send_prepared(dest, data[i], len[i]) < 0) result = -1;
+        }
+        return result;
+    }
+#endif
+
+    int result = 0;
+    for (int i = 0; i < n; i++) {
+        if (my_send_prepared(dest, data[i], len[i]) < 0) result = -1;
+    }
+    return result;
+}
+
+int cook_and_send_batch(const dest_t &dest, char *const *data, int *len, int n) {
+    for (int i = 0; i < n; i++) {
+        if (dest.cook) do_cook(data[i], len[i]);
+    }
+    return send_prepared_batch(dest, data, len, n);
+}
+
+int send_immediate_batch(const dest_t &dest, char *const *data, const int *len, int n) {
+    assert(n > 1 && n <= max_send_batch);
+    char *prepared[max_send_batch];
+    int prepared_len[max_send_batch];
+    for (int i = 0; i < n; i++) {
+        assert(len[i] >= 0 && len[i] + 100 < buf_len);
+        memcpy(immediate_batch_buffer[i], data[i], len[i]);
+        prepared[i] = immediate_batch_buffer[i];
+        prepared_len[i] = len[i];
+    }
+    return cook_and_send_batch(dest, prepared, prepared_len, n);
+}
+
+}  // namespace
 
 int delay_data_t::handle() {
     return my_send(dest, data, len) >= 0;
@@ -76,26 +219,64 @@ int delay_manager_t::add(my_time_t delay, const dest_t &dest, char *data, int le
     return 0;
 }
 
+int delay_manager_t::add_batch(const my_time_t *delay, const dest_t &dest, char *const *data, const int *len, int n) {
+    if (n <= 0) return 0;
+    if (!use_sendmmsg || n == 1) {
+        int result = 0;
+        for (int i = 0; i < n; i++) {
+            if (add(delay[i], dest, data[i], len[i]) != 0) result = -1;
+        }
+        return result;
+    }
+
+    int result = 0;
+    int i = 0;
+    while (i < n) {
+        if (delay[i] != 0) {
+            if (add(delay[i], dest, data[i], len[i]) != 0) result = -1;
+            i++;
+            continue;
+        }
+
+        int first = i;
+        while (i < n && delay[i] == 0 && i - first < max_send_batch) i++;
+        int batch_n = i - first;
+        if (batch_n == 1) {
+            if (add(0, dest, data[first], len[first]) != 0) result = -1;
+        } else if (send_immediate_batch(dest, data + first, len + first, batch_n) != 0) {
+            result = -1;
+        }
+    }
+    return result;
+}
+
 int delay_manager_t::check() {
     if (!delay_mp.empty()) {
         my_time_t current_time;
-
-        multimap<my_time_t, delay_data_t>::iterator it;
         while (1) {
-            int ret = 0;
-            it = delay_mp.begin();
+            multimap<my_time_t, delay_data_t>::iterator it = delay_mp.begin();
             if (it == delay_mp.end()) break;
 
             current_time = get_current_time_us();
-            if (it->first <= current_time) {
-                ret = it->second.handle();
-                if (ret != 0) {
-                    mylog(log_trace, "handle() return %d\n", ret);
-                }
-                free(it->second.data);
-                delay_mp.erase(it);
-            } else {
-                break;
+            if (it->first > current_time) break;
+
+            dest_t dest = it->second.dest;
+            char *data[max_send_batch];
+            int len[max_send_batch];
+            int n = 0;
+            while (it != delay_mp.end() && it->first <= current_time && n < max_send_batch && same_dest(dest, it->second.dest)) {
+                data[n] = it->second.data;
+                len[n] = it->second.len;
+                n++;
+                it = delay_mp.erase(it);
+            }
+
+            int ret = cook_and_send_batch(dest, data, len, n);
+            if (ret != 0) {
+                mylog(log_trace, "batched handle() return %d\n", ret);
+            }
+            for (int i = 0; i < n; i++) {
+                free(data[i]);
             }
         }
         if (!delay_mp.empty()) {

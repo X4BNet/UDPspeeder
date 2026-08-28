@@ -17,6 +17,7 @@ set(SOURCE_FILES
         crc32/Crc32.cpp
         packet.cpp
         delay_manager.cpp
+        receive_batch.cpp
         fd_manager.cpp
         connection.cpp
         fec_manager.cpp
@@ -31,6 +32,7 @@ set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -W
 #target_include_directories(speederv2 PRIVATE .)
 #set(CMAKE_LINK_LIBRARY_FLAG "-lrt")
 add_executable(speederv2 ${SOURCE_FILES})
+target_compile_definitions(speederv2 PRIVATE _GNU_SOURCE)
 target_link_libraries(speederv2 rt)
 target_link_libraries(speederv2 pthread)
 include_directories(SYSTEM "libev")

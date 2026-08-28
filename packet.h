@@ -25,6 +25,7 @@ extern int disable_obscure;
 extern int disable_xor;
 
 int my_send(const dest_t &dest, char *data, int len);
+int my_send_prepared(const dest_t &dest, char *data, int len);
 
 void encrypt_0(char *input, int &len, char *key);
 void decrypt_0(char *input, int &len, char *key);

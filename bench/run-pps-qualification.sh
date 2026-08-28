@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bench/run-pps-qualification.sh [options]
+
+Runs UDPspeeder through a temporary client/server network-namespace pair
+connected by a veth. Every round records real payload bytes, payload PPS,
+RTT distribution, CPU ticks, socket-memory/drop state, qdisc state, process
+state, logs, and UDPspeeder batch counters.
+
+Options:
+  --binary PATH             UDPspeeder binary (default: ./speederv2)
+  --out DIR                 artifact directory (default: /tmp/udpspeeder-pps-<timestamp>)
+  --profile NAME            nofec, fec11, fec14, or adaptive (default: nofec)
+  --rate PPS                requested payload PPS (default: 50000)
+  --payload BYTES           payload bytes: 256, 512, or 1200 (default: 512)
+  --seconds SECONDS         measured duration after warm-up (default: 10)
+  --repeat N                repetitions of this case (default: 1)
+  --recvmmsg-batch N        1..64 (default: 1)
+  --sendmmsg                enable UDPspeeder's opt-in send batching
+  --cpus E,S,C,TX,RX        echo, server, client, sender, receiver CPU ids (default: 0,1,2,3,4)
+  --netem ARGS              e.g. 'loss 1% delay 20ms 5ms'; applied to both veth egresses
+  --matrix                  run 10k/25k/50k PPS x 256/512/1200 bytes x three repeats
+  -h, --help
+
+The script needs root or passwordless sudo because it creates namespaces,
+veth links, and optional netem qdiscs. All faults stay in those namespaces.
+EOF
+}
+
+binary=./speederv2
+out=
+profile=nofec
+rate=50000
+payload=512
+seconds=10
+repeat=1
+receive_batch=1
+use_sendmmsg=0
+netem=
+matrix=0
+echo_cpu=0
+server_cpu=1
+client_cpu=2
+sender_cpu=3
+receiver_cpu=4
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --binary) binary=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        --profile) profile=$2; shift 2 ;;
+        --rate) rate=$2; shift 2 ;;
+        --payload) payload=$2; shift 2 ;;
+        --seconds) seconds=$2; shift 2 ;;
+        --repeat) repeat=$2; shift 2 ;;
+        --recvmmsg-batch) receive_batch=$2; shift 2 ;;
+        --sendmmsg) use_sendmmsg=1; shift ;;
+        --cpus)
+            IFS=, read -r echo_cpu server_cpu client_cpu sender_cpu receiver_cpu <<<"$2"
+            shift 2
+            ;;
+        --netem) netem=$2; shift 2 ;;
+        --matrix) matrix=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ ${EUID} -ne 0 ]]; then
+    echo "run this privileged harness through sudo" >&2
+    exit 2
+fi
+
+binary=$(readlink -f "$binary")
+[[ -x "$binary" ]] || { echo "not executable: $binary" >&2; exit 2; }
+[[ "$receive_batch" =~ ^[0-9]+$ ]] && ((receive_batch >= 1 && receive_batch <= 64)) || { echo "invalid --recvmmsg-batch" >&2; exit 2; }
+for cpu in "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"; do
+    [[ "$cpu" =~ ^[0-9]+$ ]] || { echo "--cpus needs five comma-separated CPU ids" >&2; exit 2; }
+done
+
+if [[ -z "$out" ]]; then
+    out="/tmp/udpspeeder-pps-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+fi
+mkdir -p "$out/bin"
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cc -O2 -Wall -Wextra -Werror -o "$out/bin/udp_echo" "$root/bench/udp_echo.c"
+cc -O2 -Wall -Wextra -Werror -pthread -o "$out/bin/udp_pps_generator" "$root/bench/udp_pps_generator.c"
+
+run_id=$$
+client_ns="usp-c-${run_id}"
+server_ns="usp-s-${run_id}"
+client_veth="usp${run_id: -6}c"
+server_veth="usp${run_id: -6}s"
+client_ip=10.254.251.1
+server_ip=10.254.251.2
+server_pid=
+client_pid=
+echo_pid=
+
+cleanup_processes() {
+    for pid in "${server_pid:-}" "${client_pid:-}" "${echo_pid:-}"; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done
+    wait "${server_pid:-}" "${client_pid:-}" "${echo_pid:-}" 2>/dev/null || true
+    server_pid=
+    client_pid=
+    echo_pid=
+}
+
+cleanup() {
+    cleanup_processes
+    ip netns del "$client_ns" 2>/dev/null || true
+    ip netns del "$server_ns" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+ip netns add "$client_ns"
+ip netns add "$server_ns"
+ip link add "$client_veth" type veth peer name "$server_veth"
+ip link set "$client_veth" netns "$client_ns"
+ip link set "$server_veth" netns "$server_ns"
+ip -n "$client_ns" link set lo up
+ip -n "$server_ns" link set lo up
+ip -n "$client_ns" addr add "$client_ip/30" dev "$client_veth"
+ip -n "$server_ns" addr add "$server_ip/30" dev "$server_veth"
+ip -n "$client_ns" link set "$client_veth" up
+ip -n "$server_ns" link set "$server_veth" up
+
+{
+    date -u +%FT%TZ
+    uname -a
+    sha256sum "$binary"
+    "$binary" --help | sed -n '1,8p'
+    sysctl -n net.core.rmem_max net.core.wmem_max
+    printf 'cpus=echo:%s server:%s client:%s sender:%s receiver:%s\n' "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"
+} >"$out/environment.txt"
+
+if [[ -n "$netem" ]]; then
+    ip netns exec "$client_ns" tc qdisc replace dev "$client_veth" root netem $netem
+    ip netns exec "$server_ns" tc qdisc replace dev "$server_veth" root netem $netem
+fi
+
+ticks() {
+    awk '{print $14 + $15}' "/proc/$1/stat"
+}
+
+capture_interface_counters() {
+    local namespace=$1
+    local interface=$2
+    local destination=$3
+    ip netns exec "$namespace" sh -c '
+        for counter in rx_bytes tx_bytes rx_packets tx_packets rx_dropped tx_dropped; do
+            printf "%s=" "$counter"
+            cat "/sys/class/net/'"$interface"'/statistics/$counter"
+        done
+    ' >"$destination"
+}
+
+counter_value() {
+    local file=$1
+    local counter=$2
+    awk -F= -v counter="$counter" '$1 == counter { print $2; exit }' "$file"
+}
+
+profile_args() {
+    case "$1" in
+        nofec) printf '%s\0' --disable-fec ;;
+        fec11) printf '%s\0' -f1:1 --mode 1 --timeout 0 ;;
+        fec14) printf '%s\0' -f1:4 --mode 1 --timeout 0 ;;
+        adaptive) printf '%s\0' -f1:4 --mode 1 --timeout 0 --adaptive-fec --adaptive-feedback-ms 100 ;;
+        *) echo "unknown profile: $1" >&2; exit 2 ;;
+    esac
+}
+
+run_case() {
+    local case_name=$1
+    local case_profile=$2
+    local case_rate=$3
+    local case_payload=$4
+    local case_iteration=$5
+    local dir="$out/$case_name/run-$case_iteration"
+    local -a fec_args=()
+    local -a send_args=()
+    mkdir -p "$dir"
+    mapfile -d '' fec_args < <(profile_args "$case_profile")
+    [[ $use_sendmmsg -eq 1 ]] && send_args+=(--sendmmsg)
+
+    ip netns exec "$server_ns" taskset -c "$echo_cpu" "$out/bin/udp_echo" "$server_ip" 41000 >"$dir/echo.log" 2>&1 & echo_pid=$!
+    ip netns exec "$server_ns" taskset -c "$server_cpu" "$binary" -s -l"$server_ip":41001 -r"$server_ip":41000 \
+        "${fec_args[@]}" --sock-buf 10240 --recvmmsg-batch "$receive_batch" "${send_args[@]}" --report 1 --disable-color --log-level 4 >"$dir/server.log" 2>&1 & server_pid=$!
+    ip netns exec "$client_ns" taskset -c "$client_cpu" "$binary" -c -l"$client_ip":41002 -r"$server_ip":41001 \
+        "${fec_args[@]}" --sock-buf 10240 --recvmmsg-batch "$receive_batch" "${send_args[@]}" --report 1 --disable-color --log-level 4 >"$dir/client.log" 2>&1 & client_pid=$!
+    sleep 1
+
+    local client_before server_before client_after server_after
+    client_before=$(ticks "$client_pid")
+    server_before=$(ticks "$server_pid")
+    capture_interface_counters "$client_ns" "$client_veth" "$dir/client-interface-before.txt"
+    capture_interface_counters "$server_ns" "$server_veth" "$dir/server-interface-before.txt"
+    ip netns exec "$client_ns" "$out/bin/udp_pps_generator" "$client_ip" 41002 "$case_rate" "$seconds" "$case_payload" "$sender_cpu" "$receiver_cpu" >"$dir/generator.txt" 2>&1 &
+    local generator_pid=$!
+    sleep 2
+    ip netns exec "$client_ns" ss -u -a -n -m >"$dir/client-sockets-at-load.txt"
+    ip netns exec "$server_ns" ss -u -a -n -m >"$dir/server-sockets-at-load.txt"
+    ip netns exec "$client_ns" tc -s qdisc show dev "$client_veth" >"$dir/client-qdisc-at-load.txt"
+    ip netns exec "$server_ns" tc -s qdisc show dev "$server_veth" >"$dir/server-qdisc-at-load.txt"
+    ps -o pid,ni,stat,pcpu,comm -p "$client_pid","$server_pid","$echo_pid" >"$dir/process-at-load.txt"
+    wait "$generator_pid"
+    client_after=$(ticks "$client_pid")
+    server_after=$(ticks "$server_pid")
+    local clock_ticks client_cpu_ticks server_cpu_ticks
+    clock_ticks=$(getconf CLK_TCK)
+    client_cpu_ticks=$((client_after-client_before))
+    server_cpu_ticks=$((server_after-server_before))
+    printf 'client_cpu_ticks=%s client_cpu_seconds=%.3f server_cpu_ticks=%s server_cpu_seconds=%.3f\n' \
+        "$client_cpu_ticks" "$(awk -v ticks="$client_cpu_ticks" -v hz="$clock_ticks" 'BEGIN { printf "%.3f", ticks / hz }')" \
+        "$server_cpu_ticks" "$(awk -v ticks="$server_cpu_ticks" -v hz="$clock_ticks" 'BEGIN { printf "%.3f", ticks / hz }')" >"$dir/cpu.txt"
+    capture_interface_counters "$client_ns" "$client_veth" "$dir/client-interface-final.txt"
+    capture_interface_counters "$server_ns" "$server_veth" "$dir/server-interface-final.txt"
+    local client_tx_before client_tx_after client_tx_bytes_before client_tx_bytes_after wire_packets wire_bytes
+    client_tx_before=$(counter_value "$dir/client-interface-before.txt" tx_packets)
+    client_tx_after=$(counter_value "$dir/client-interface-final.txt" tx_packets)
+    client_tx_bytes_before=$(counter_value "$dir/client-interface-before.txt" tx_bytes)
+    client_tx_bytes_after=$(counter_value "$dir/client-interface-final.txt" tx_bytes)
+    wire_packets=$((client_tx_after-client_tx_before))
+    wire_bytes=$((client_tx_bytes_after-client_tx_bytes_before))
+    printf 'client_wire_packets=%s client_wire_pps=%.3f client_wire_bytes=%s client_wire_mbit=%.3f\n' \
+        "$wire_packets" "$(awk -v packets="$wire_packets" -v duration="$seconds" 'BEGIN { printf "%.3f", packets / duration }')" \
+        "$wire_bytes" "$(awk -v bytes="$wire_bytes" -v duration="$seconds" 'BEGIN { printf "%.3f", bytes * 8 / duration / 1000000 }')" >"$dir/wire.txt"
+    ip netns exec "$client_ns" tc -s qdisc show dev "$client_veth" >"$dir/client-qdisc-final.txt"
+    ip netns exec "$server_ns" tc -s qdisc show dev "$server_veth" >"$dir/server-qdisc-final.txt"
+    rg '\[report\]\[io\]' "$dir/client.log" >"$dir/client-batch-counters.txt" || true
+    rg '\[report\]\[io\]' "$dir/server.log" >"$dir/server-batch-counters.txt" || true
+    printf '%s ' "$case_name/run-$case_iteration" | tee -a "$out/summary.txt"
+    tr '\n' ' ' <"$dir/generator.txt" | tee -a "$out/summary.txt"
+    tr '\n' ' ' <"$dir/cpu.txt" | tee -a "$out/summary.txt"
+    tr '\n' ' ' <"$dir/wire.txt" | tee -a "$out/summary.txt"
+    printf '\n' | tee -a "$out/summary.txt"
+    cleanup_processes
+    sleep 1
+}
+
+if [[ $matrix -eq 1 ]]; then
+    for case_profile in nofec fec11 fec14 adaptive; do
+        for case_payload in 256 512 1200; do
+            for case_rate in 10000 25000 50000; do
+                for case_iteration in 1 2 3; do
+                    run_case "${case_profile}-${case_rate}pps-${case_payload}b-b${receive_batch}" "$case_profile" "$case_rate" "$case_payload" "$case_iteration"
+                done
+            done
+        done
+    done
+else
+    for case_iteration in $(seq 1 "$repeat"); do
+        run_case "${profile}-${rate}pps-${payload}b-b${receive_batch}" "$profile" "$rate" "$payload" "$case_iteration"
+    done
+fi
+
+printf 'artifacts=%s\n' "$out"
