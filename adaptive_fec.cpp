@@ -17,6 +17,7 @@ const int adaptive_fec_mac_len = 2 * sizeof(u32_t);
 const int adaptive_fec_legacy_hello_len = adaptive_fec_legacy_hello_without_mac_len + adaptive_fec_mac_len;
 const int adaptive_fec_feedback_len = adaptive_fec_header_len + 4 * sizeof(u32_t) + adaptive_fec_mac_len;
 const int adaptive_fec_bypass_header_len = adaptive_fec_header_len + sizeof(u32_t);
+const int adaptive_fec_bypass_reorder_window = 256;
 
 // This only protects the opt-in control plane when -k is omitted.  It must
 // not become UDPspeeder's global key: doing that would silently enable XOR
@@ -107,7 +108,6 @@ u64_t adaptive_fec_mac(const char *data, int length) {
     const unsigned char *key = (const unsigned char *)configured_key;
     u64_t k0 = load_little_endian_u64(key);
     u64_t k1 = load_little_endian_u64(key + 8);
-
     u64_t v0 = 0x736f6d6570736575ULL ^ k0;
     u64_t v1 = 0x646f72616e646f6dULL ^ k1;
     u64_t v2 = 0x6c7967656e657261ULL ^ k0;
@@ -140,23 +140,10 @@ u64_t adaptive_fec_mac(const char *data, int length) {
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-void append_mac(char *data, int &length) {
-    u64_t mac = adaptive_fec_mac(data, length);
-    write_u32(data + length, (u32_t)(mac >> 32));
-    write_u32(data + length + sizeof(u32_t), (u32_t)mac);
-    length += adaptive_fec_mac_len;
-}
-
-int validate_mac(const char *data, int length) {
-    if (length < adaptive_fec_mac_len) return 0;
-    int payload_length = length - adaptive_fec_mac_len;
-    u64_t expected = (u64_t(read_u32((char *)data + payload_length)) << 32) | read_u32((char *)data + payload_length + sizeof(u32_t));
-    return adaptive_fec_mac(data, payload_length) == expected;
-}
-
 }  // namespace
 
 adaptive_fec_config_t g_adaptive_fec_config;
+int adaptive_fec_statistics_enabled = 0;
 
 int adaptive_fec_config_t::configure(const fec_parameter_t &base, const char *normal_profile, const char *guard_profile, const char *degraded_profile) {
     normal.clone(base);
@@ -195,8 +182,32 @@ adaptive_fec_controller_t::adaptive_fec_controller_t() {
     control_sequence = get_fake_random_number();
     bypass_sequence = get_fake_random_number();
     received_bypass_sequence = 0;
-    last_received_bypass_sequence = 0;
+    next_expected_bypass_sequence = 0;
+    memset(bypass_reorder_bits, 0, sizeof(bypass_reorder_bits));
     window_stats = fec_decode_stats_t();
+    statistics.clear();
+}
+
+void adaptive_fec_controller_t::append_mac(char *data, int &length) {
+    if (adaptive_fec_statistics_enabled) {
+        statistics.mac_sent_packets++;
+        statistics.mac_sent_bytes += length;
+    }
+    u64_t mac = adaptive_fec_mac(data, length);
+    write_u32(data + length, (u32_t)(mac >> 32));
+    write_u32(data + length + sizeof(u32_t), (u32_t)mac);
+    length += adaptive_fec_mac_len;
+}
+
+int adaptive_fec_controller_t::validate_mac(const char *data, int length) {
+    if (length < adaptive_fec_mac_len) return 0;
+    int payload_length = length - adaptive_fec_mac_len;
+    if (adaptive_fec_statistics_enabled) {
+        statistics.mac_received_packets++;
+        statistics.mac_received_bytes += payload_length;
+    }
+    u64_t expected = (u64_t(read_u32((char *)data + payload_length)) << 32) | read_u32((char *)data + payload_length + sizeof(u32_t));
+    return adaptive_fec_mac(data, payload_length) == expected;
 }
 
 const fec_parameter_t &adaptive_fec_controller_t::profile_for_state() const {
@@ -221,6 +232,7 @@ void adaptive_fec_controller_t::set_state(adaptive_fec_state_t new_state, const 
     state_changed_time = get_current_time_us();
     clean_windows = 0;
     profile_dirty = 1;
+    if (adaptive_fec_statistics_enabled) statistics.state_transitions++;
 }
 
 int adaptive_fec_controller_t::can_bypass() const {
@@ -232,6 +244,7 @@ int adaptive_fec_controller_t::take_profile_update(fec_parameter_t &profile) {
 
     profile.clone(profile_for_state());
     profile_dirty = 0;
+    if (adaptive_fec_statistics_enabled) statistics.profile_updates++;
     return 1;
 }
 
@@ -244,24 +257,71 @@ void adaptive_fec_controller_t::observe_decoder_stats(const fec_decode_stats_t &
     saturating_add(window_stats.reordered_packets, stats.reordered_packets);
 }
 
+int adaptive_fec_controller_t::bypass_reorder_bit(int index) const {
+    assert(index >= 0 && index < adaptive_fec_bypass_reorder_window);
+    return (bypass_reorder_bits[index / 64] >> (index % 64)) & 1;
+}
+
+void adaptive_fec_controller_t::set_bypass_reorder_bit(int index) {
+    assert(index >= 0 && index < adaptive_fec_bypass_reorder_window);
+    bypass_reorder_bits[index / 64] |= u64_t(1) << (index % 64);
+}
+
+void adaptive_fec_controller_t::advance_bypass_reorder_window(int count) {
+    if (count <= 0) return;
+    if (count >= adaptive_fec_bypass_reorder_window) {
+        memset(bypass_reorder_bits, 0, sizeof(bypass_reorder_bits));
+        return;
+    }
+
+    const int word_shift = count / 64;
+    const int bit_shift = count % 64;
+    for (int i = 0; i < 4; i++) {
+        u64_t shifted = 0;
+        if (i + word_shift < 4) {
+            shifted = bypass_reorder_bits[i + word_shift] >> bit_shift;
+            if (bit_shift != 0 && i + word_shift + 1 < 4) {
+                shifted |= bypass_reorder_bits[i + word_shift + 1] << (64 - bit_shift);
+            }
+        }
+        bypass_reorder_bits[i] = shifted;
+    }
+}
+
 void adaptive_fec_controller_t::note_bypass_sequence(u32_t sequence) {
     if (!received_bypass_sequence) {
         received_bypass_sequence = 1;
-        last_received_bypass_sequence = sequence;
+        next_expected_bypass_sequence = sequence + 1;
+        memset(bypass_reorder_bits, 0, sizeof(bypass_reorder_bits));
         saturating_add(window_stats.delivered_packets, 1);
         return;
     }
 
-    if (sequence == last_received_bypass_sequence) {
-        saturating_add(window_stats.reordered_packets, 1);
-        return;
-    }
-
-    u32_t delta = sequence - last_received_bypass_sequence;
+    u32_t delta = sequence - next_expected_bypass_sequence;
     if (delta < 0x80000000U) {
-        if (delta > 1) saturating_add(window_stats.unrecoverable_packets, delta - 1);
-        last_received_bypass_sequence = sequence;
+        // Keep forward arrivals until their missing predecessor falls out of
+        // a 256-packet window. Delay variation is therefore reported as
+        // reordering, not irreversible loss that would trigger excess FEC.
+        if (delta >= (u32_t)adaptive_fec_bypass_reorder_window) {
+            int expired = (int)(delta - (adaptive_fec_bypass_reorder_window - 1));
+            saturating_add(window_stats.unrecoverable_packets, expired);
+            advance_bypass_reorder_window(expired);
+            next_expected_bypass_sequence += expired;
+            delta = sequence - next_expected_bypass_sequence;
+        }
+        if (bypass_reorder_bit((int)delta)) {
+            saturating_add(window_stats.reordered_packets, 1);
+        } else {
+            set_bypass_reorder_bit((int)delta);
+            if (delta != 0) saturating_add(window_stats.reordered_packets, 1);
+        }
+        while (bypass_reorder_bit(0)) {
+            advance_bypass_reorder_window(1);
+            next_expected_bypass_sequence++;
+        }
     } else {
+        // The packet is late relative to the current window. UDP delivery is
+        // still immediate; only adaptive feedback classification changes.
         saturating_add(window_stats.reordered_packets, 1);
     }
     saturating_add(window_stats.delivered_packets, 1);
@@ -278,7 +338,12 @@ void adaptive_fec_controller_t::update_from_feedback(const fec_decode_stats_t &s
     mylog(log_debug, "adaptive-fec feedback samples=%u delivered=%u recovered=%u unrecoverable=%u reordered=%u\n",
           samples, stats.delivered_packets, stats.recovered_packets, stats.unrecoverable_packets, stats.reordered_packets);
 
-    int severe = unrecoverable_per_mille >= 30 || recovered_per_mille >= 120;
+    // A short direct-bypass window can see one packet disappear before its
+    // delayed neighbour arrives. Do not let a single observation select the
+    // highest-redundancy profile; keep the percentage threshold but require
+    // several observations as transition hysteresis.
+    int severe = (stats.unrecoverable_packets >= 3 && unrecoverable_per_mille >= 30) ||
+                 (stats.recovered_packets >= 3 && recovered_per_mille >= 120);
     int impaired = unrecoverable_per_mille >= 10 || recovered_per_mille >= 20 || reordered_per_mille >= 50;
     int clean = unrecoverable_per_mille == 0 && recovered_per_mille == 0 && reordered_per_mille < 10;
 
@@ -325,6 +390,7 @@ int adaptive_fec_controller_t::build_hello(char *&data, int &len) {
     data = control_buffer;
     len = adaptive_fec_legacy_hello_without_mac_len;
     append_mac(data, len);
+    if (adaptive_fec_statistics_enabled) statistics.control_sent_packets++;
     assert(len == adaptive_fec_legacy_hello_len);
     return 1;
 }
@@ -341,6 +407,7 @@ int adaptive_fec_controller_t::build_feedback(char *&data, int &len) {
     write_u32(control_buffer + offset, window_stats.reordered_packets);
     offset += sizeof(u32_t);
     append_mac(control_buffer, offset);
+    if (adaptive_fec_statistics_enabled) statistics.control_sent_packets++;
     assert(offset == adaptive_fec_feedback_len);
     window_stats = fec_decode_stats_t();
     data = control_buffer;
@@ -376,6 +443,10 @@ int adaptive_fec_controller_t::build_bypass(char *payload, int payload_len, char
     data = bypass_buffer;
     len = payload_len + adaptive_fec_bypass_header_len;
     append_mac(data, len);
+    if (adaptive_fec_statistics_enabled) {
+        statistics.bypass_sent_packets++;
+        statistics.bypass_sent_payload_bytes += payload_len;
+    }
     if (!bypass_active_logged) {
         mylog(log_info, "adaptive-fec direct bypass active\n");
         bypass_active_logged = 1;
@@ -410,6 +481,7 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
             hello_response_pending = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
+        if (adaptive_fec_statistics_enabled) statistics.control_received_packets++;
         return adaptive_fec_consumed;
     }
 
@@ -428,6 +500,7 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
             hello_response_pending = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
+        if (adaptive_fec_statistics_enabled) statistics.control_received_packets++;
         return adaptive_fec_consumed;
     }
     if (kind == adaptive_fec_feedback) {
@@ -450,6 +523,7 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
         update_from_feedback(stats);
+        if (adaptive_fec_statistics_enabled) statistics.control_received_packets++;
         return adaptive_fec_consumed;
     }
     if (kind == adaptive_fec_bypass_frame) {
@@ -465,11 +539,31 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         note_bypass_sequence(read_u32(data + adaptive_fec_header_len));
         payload = data + adaptive_fec_bypass_header_len;
         payload_len = len - adaptive_fec_bypass_header_len - adaptive_fec_mac_len;
+        if (adaptive_fec_statistics_enabled) {
+            statistics.bypass_received_packets++;
+            statistics.bypass_received_payload_bytes += payload_len;
+        }
         return adaptive_fec_bypass;
     }
 
     mylog(log_warn, "unknown adaptive-fec control frame\n");
     return adaptive_fec_consumed;
+}
+
+void adaptive_fec_controller_t::report_statistics(const char *role) {
+    if (!adaptive_fec_statistics_enabled) return;
+    if (statistics.bypass_sent_packets == 0 && statistics.bypass_received_packets == 0 && statistics.control_sent_packets == 0 && statistics.control_received_packets == 0) return;
+
+    mylog(log_info,
+          "[report][adaptive-fec][%s] bypass_out=%llu/%lluB bypass_in=%llu/%lluB control_out=%llu control_in=%llu mac_out=%llu/%lluB mac_in=%llu/%lluB profile_updates=%llu state_transitions=%llu\n",
+          role,
+          statistics.bypass_sent_packets, statistics.bypass_sent_payload_bytes,
+          statistics.bypass_received_packets, statistics.bypass_received_payload_bytes,
+          statistics.control_sent_packets, statistics.control_received_packets,
+          statistics.mac_sent_packets, statistics.mac_sent_bytes,
+          statistics.mac_received_packets, statistics.mac_received_bytes,
+          statistics.profile_updates, statistics.state_transitions);
+    statistics.clear();
 }
 
 int adaptive_fec_unit_test() {
@@ -521,10 +615,35 @@ int adaptive_fec_unit_test() {
     assert(payload_len == (int)strlen(test_payload));
     assert(memcmp(payload, test_payload, payload_len) == 0);
 
-    // A sequence gap is receiver-observed loss.  It must make the sender
-    // leave normal once the feedback is returned.
+    // Reorder two direct frames, then add enough in-order observations that
+    // reordering alone is below the guard threshold. The delayed frame must
+    // not become an unrecoverable gap in the feedback sent to the peer.
+    char reordered_first[buf_len];
+    int reordered_first_len = 0;
+    char reordered_second[buf_len];
+    int reordered_second_len = 0;
     assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);
+    memcpy(reordered_first, control, control_len);
+    reordered_first_len = control_len;
     assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);
+    memcpy(reordered_second, control, control_len);
+    reordered_second_len = control_len;
+    assert(receiver.process_inbound(reordered_second, reordered_second_len, payload, payload_len) == adaptive_fec_bypass);
+    assert(receiver.process_inbound(reordered_first, reordered_first_len, payload, payload_len) == adaptive_fec_bypass);
+    for (int i = 0; i < 40; i++) {
+        assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);
+        assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_bypass);
+    }
+    assert(receiver.build_pending_control(control, control_len) == 1);
+    assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
+    assert(sender.get_state() == adaptive_fec_normal);
+
+    // A gap becomes receiver-observed loss only after it survives the bounded
+    // reordering window. This keeps late UDP packets from spuriously turning
+    // into loss, while a genuinely missing sequence still leaves normal.
+    for (int i = 0; i < 257; i++) {
+        assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);
+    }
     assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_bypass);
     assert(receiver.build_pending_control(control, control_len) == 1);
     assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);

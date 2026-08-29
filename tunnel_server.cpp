@@ -78,7 +78,7 @@ void data_from_fec_timeout_or_conn_timer(conn_info_t &conn_info, tmp_mode_t mode
             delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
         }
 
-        conn_info.stat.report_as_server(addr);
+        if (conn_info.stat.report_as_server(addr)) conn_info.adaptive_fec.report_statistics("server");
         return;
     } else {
         assert(0 == 1);

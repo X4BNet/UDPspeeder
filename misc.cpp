@@ -470,7 +470,9 @@ int unit_test() {
         fec_decode_stats_t recovery_stats;
         assert(mode_one_decoder->take_statistics(recovery_stats) == 0);
         assert(recovery_stats.delivered_packets == 1);
-        assert(recovery_stats.recovered_packets == 1);
+        // A parity-first k=1 replica is delivered successfully, but it is
+        // not a confirmed recovery: the systematic copy may only be late.
+        assert(recovery_stats.recovered_packets == 0);
 
         // An old sender advertises the systematic frame with data_num=0.
         // The new decoder must retain that generic group and suppress the
@@ -734,6 +736,7 @@ void process_arg(int argc, char *argv[]) {
     int i, j, k;
     int opt;
     int adaptive_fec_requested = 0;
+    int adaptive_fec_statistics_requested = 0;
     char adaptive_normal_profile[rs_str_len] = "";
     char adaptive_guard_profile[rs_str_len] = "";
     char adaptive_degraded_profile[rs_str_len] = "";
@@ -776,6 +779,7 @@ void process_arg(int argc, char *argv[]) {
             {"persist-tun", no_argument, 0, 1},
             {"manual-set-tun", no_argument, 0, 1},
             {"adaptive-fec", no_argument, 0, 1},
+            {"adaptive-fec-stats", no_argument, 0, 1},
             {"adaptive-normal", required_argument, 0, 1},
             {"adaptive-guard", required_argument, 0, 1},
             {"adaptive-degraded", required_argument, 0, 1},
@@ -1046,6 +1050,8 @@ void process_arg(int argc, char *argv[]) {
                     mylog(log_warn, "mssfix=%d\n", mssfix);
                 } else if (strcmp(long_options[option_index].name, "adaptive-fec") == 0) {
                     adaptive_fec_requested = 1;
+                } else if (strcmp(long_options[option_index].name, "adaptive-fec-stats") == 0) {
+                    adaptive_fec_statistics_requested = 1;
                 } else if (strcmp(long_options[option_index].name, "adaptive-normal") == 0) {
                     adaptive_fec_requested = 1;
                     if (strlen(optarg) >= sizeof(adaptive_normal_profile)) {
@@ -1162,6 +1168,7 @@ void process_arg(int argc, char *argv[]) {
             myexit(-1);
         }
         g_adaptive_fec_config.enabled = 1;
+        adaptive_fec_statistics_enabled = adaptive_fec_statistics_requested;
     }
 
     print_parameter();

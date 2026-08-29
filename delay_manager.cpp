@@ -151,6 +151,23 @@ int send_immediate_batch(const dest_t &dest, char *const *data, const int *len, 
 
 }  // namespace
 
+int send_immediate_batch_in_place(const dest_t &dest, char *const *data, int *len, int n) {
+    if (n <= 0) return 0;
+    assert(n <= max_send_batch);
+
+    // Preserve delay_send_batch's random-drop semantics before cooking.
+    char *kept_data[max_send_batch];
+    int kept_len[max_send_batch];
+    int kept_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (dest.cook && random_drop != 0 && get_fake_random_number() % 10000 < (u32_t)random_drop) continue;
+        kept_data[kept_n] = data[i];
+        kept_len[kept_n] = len[i];
+        kept_n++;
+    }
+    return cook_and_send_batch(dest, kept_data, kept_len, kept_n);
+}
+
 int delay_data_t::handle() {
     return my_send(dest, data, len) >= 0;
 }

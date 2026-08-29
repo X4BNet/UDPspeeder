@@ -561,7 +561,12 @@ int fec_decode_manager_t::input(char *s, int len) {
         output_len_arr = output_len_arr_buf;
         ready_for_output = 1;
         statistics.delivered_packets++;
-        if (inner_index != 0) statistics.recovered_packets++;
+        // A k=1 group is sent as replicas and delivered on the first frame.
+        // Seeing a parity replica first does not prove the systematic frame
+        // was lost: it may simply be delayed or reordered. Treating every
+        // parity-first arrival as recovered makes adaptive FEC see severe
+        // phantom loss on a healthy, reordered link. Delivery still occurs
+        // immediately; only the loss-feedback classification changes.
         anti_replay.set_invalid(seq);
         return 0;
     }

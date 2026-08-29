@@ -141,4 +141,9 @@ struct delay_manager_t {
 
 extern int use_sendmmsg;
 
+// Sends callback-owned packets synchronously.  Unlike delay_manager_t::add,
+// this does not take an ownership copy: callers must keep every buffer valid
+// through the call and must only use it for zero-delay packets.
+int send_immediate_batch_in_place(const dest_t &dest, char *const *data, int *len, int n);
+
 #endif /* DELAY_MANAGER_H_ */

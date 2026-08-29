@@ -134,6 +134,45 @@ not produce a repeatable gain. The retained direct k=1 delivery path replaces
 generic decoder bookkeeping only when its buffer lifetime is synchronous and
 validated.
 
+## Receive-to-send handoff correction
+
+`--sendmmsg` was previously only reached when one call to the FEC encoder
+already emitted multiple frames. This left the no-FEC, adaptive-direct, and
+decoded normal-packet paths calling `delay_send` once per result, even when
+`recvmmsg` had just returned a full receive batch. Thus an `strace` correctly
+showed mostly `sendto` despite `--sendmmsg` being enabled.
+
+The receive callbacks now use an allocation-free `immediate_send_batch_t`.
+It copies output before another decoder call can reuse the source buffer, then
+flushes it through `delay_send_batch` at the end of the same libev callback.
+There is no timer, deliberate aggregation wait, or destination comparison in
+this path: a UDPspeeder forwarding callback has one configured egress peer.
+The change applies to client local/remote and server local/per-connection
+remote forwarding. A 32-packet `recvmmsg` result therefore reaches the
+`sendmmsg` path as a 32-message send; the callback may drain up to 128 packets
+before flushing.
+
+The helper has a UDP unit test that checks arrival order and verifies one
+Linux `sendmmsg` call sends three datagrams. Sanitizer unit tests pass.
+
+Native `-O3`, 512-byte, no-FEC, 50k payload-PPS A/B rounds used
+`--recvmmsg-batch 32 --sendmmsg` and CPUs 32--36. The baseline advertised
+`--sendmmsg` but made zero batch-send calls because every forwarding result
+was one packet. The candidate's logs record batch sends with zero partial
+sends, `EAGAIN`, or fallback packets.
+
+| Binary | Three-run median delivery | Three-run median p99 | Client/server CPU median | Decision |
+|---|---:|---:|---:|---|
+| Prior receive-only batching | 97.127% | 364.090 ms | 9.96 / 9.31 s | Fails gate |
+| Callback egress batching | 99.509% | 129.009 ms | 9.79 / 9.24 s | Material improvement; still not default |
+
+The final post-cleanup candidate (`cd2a96e7a8a94bdb5f1d2845484a6d0c452fff1800aaa69c837e5bc4c710c4e0`)
+also completed 99.690% delivery with 70.953 ms p99 in a single 10-second
+round. The host was shared and the individual rounds vary substantially, so
+this is evidence for retaining the handoff correction, not evidence for
+promoting either batching option by default. It still misses the strict
+50k-PPS p99 <= 10 ms gate.
+
 ## Raw artifacts
 
 All artifacts are retained locally under `/tmp` and contain `environment.txt`,
@@ -155,6 +194,7 @@ snapshots, logs, and batch counters:
 - `/tmp/udpspeeder-k1-direct-baseline-o3-10k-r1`, `-r2`, `-r3-20s`, and their candidate counterparts
 - `/tmp/udpspeeder-k1-direct-baseline-o3-10k-loss1`, `/tmp/udpspeeder-k1-direct-candidate-final-10k-loss1`, and `/tmp/udpspeeder-k1-direct-candidate-final-5k-loss5`
 - `/tmp/udpspeeder-k1-direct-mixed-new-client` and `/tmp/udpspeeder-k1-direct-mixed-new-server`
+- `/tmp/udpspeeder-output-batch-baseline-50k`, `/tmp/udpspeeder-output-batch-o3-50k`, and `/tmp/udpspeeder-output-batch-final-50k`
 
 ## Next qualification
 

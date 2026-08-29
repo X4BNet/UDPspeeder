@@ -20,12 +20,14 @@ Options:
   --rate PPS                requested payload PPS (default: 50000)
   --payload BYTES           payload bytes: 256, 512, or 1200 (default: 512)
   --seconds SECONDS         measured duration after warm-up (default: 10)
-  --repeat N                repetitions of this case (default: 1)
+  --repeat N                repetitions of this case (default: 5)
   --recvmmsg-batch N        1..64 (default: 1)
   --sendmmsg                enable UDPspeeder's opt-in send batching
+  --perf                    capture client/server software perf profiles
   --cpus E,S,C,TX,RX        echo, server, client, sender, receiver CPU ids (default: 0,1,2,3,4)
   --netem ARGS              e.g. 'loss 1% delay 20ms 5ms'; applied to both veth egresses
-  --matrix                  run 10k/25k/50k PPS x 256/512/1200 bytes x three repeats
+  --matrix                  run 10k/25k/50k PPS x 256/512/1200 bytes x --repeat rounds for all profiles
+  --knee                    run 10k/25k/50k/75k/100k PPS x 256/512/1200 bytes for --profile
   -h, --help
 
 The script needs root or passwordless sudo because it creates namespaces,
@@ -41,11 +43,13 @@ profile=nofec
 rate=50000
 payload=512
 seconds=10
-repeat=1
+repeat=5
 receive_batch=1
 use_sendmmsg=0
+use_perf=0
 netem=
 matrix=0
+knee=0
 echo_cpu=0
 server_cpu=1
 client_cpu=2
@@ -65,12 +69,14 @@ while [[ $# -gt 0 ]]; do
         --repeat) repeat=$2; shift 2 ;;
         --recvmmsg-batch) receive_batch=$2; shift 2 ;;
         --sendmmsg) use_sendmmsg=1; shift ;;
+        --perf) use_perf=1; shift ;;
         --cpus)
             IFS=, read -r echo_cpu server_cpu client_cpu sender_cpu receiver_cpu <<<"$2"
             shift 2
             ;;
         --netem) netem=$2; shift 2 ;;
         --matrix) matrix=1; shift ;;
+        --knee) knee=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -88,6 +94,9 @@ if [[ -z "$server_binary" ]]; then server_binary=$binary; else server_binary=$(r
 [[ -x "$client_binary" ]] || { echo "not executable: $client_binary" >&2; exit 2; }
 [[ -x "$server_binary" ]] || { echo "not executable: $server_binary" >&2; exit 2; }
 [[ "$receive_batch" =~ ^[0-9]+$ ]] && ((receive_batch >= 1 && receive_batch <= 64)) || { echo "invalid --recvmmsg-batch" >&2; exit 2; }
+if [[ $use_perf -eq 1 ]]; then
+    command -v perf >/dev/null || { echo "--perf requires perf" >&2; exit 2; }
+fi
 for cpu in "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"; do
     [[ "$cpu" =~ ^[0-9]+$ ]] || { echo "--cpus needs five comma-separated CPU ids" >&2; exit 2; }
 done
@@ -111,15 +120,23 @@ server_ip=10.254.251.2
 server_pid=
 client_pid=
 echo_pid=
+client_perf_record_pid=
+server_perf_record_pid=
+client_perf_stat_pid=
+server_perf_stat_pid=
 
 cleanup_processes() {
-    for pid in "${server_pid:-}" "${client_pid:-}" "${echo_pid:-}"; do
+    for pid in "${server_pid:-}" "${client_pid:-}" "${echo_pid:-}" "${client_perf_record_pid:-}" "${server_perf_record_pid:-}" "${client_perf_stat_pid:-}" "${server_perf_stat_pid:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     done
-    wait "${server_pid:-}" "${client_pid:-}" "${echo_pid:-}" 2>/dev/null || true
+    wait "${server_pid:-}" "${client_pid:-}" "${echo_pid:-}" "${client_perf_record_pid:-}" "${server_perf_record_pid:-}" "${client_perf_stat_pid:-}" "${server_perf_stat_pid:-}" 2>/dev/null || true
     server_pid=
     client_pid=
     echo_pid=
+    client_perf_record_pid=
+    server_perf_record_pid=
+    client_perf_stat_pid=
+    server_perf_stat_pid=
 }
 
 cleanup() {
@@ -146,13 +163,23 @@ ip -n "$server_ns" link set "$server_veth" up
     uname -a
     sha256sum "$client_binary" "$server_binary"
     "$client_binary" --help | sed -n '1,8p'
+    if [[ $use_perf -eq 1 ]]; then perf --version; fi
     sysctl -n net.core.rmem_max net.core.wmem_max
     printf 'cpus=echo:%s server:%s client:%s sender:%s receiver:%s\n' "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"
 } >"$out/environment.txt"
 
 if [[ -n "$netem" ]]; then
-    ip netns exec "$client_ns" tc qdisc replace dev "$client_veth" root netem $netem
-    ip netns exec "$server_ns" tc qdisc replace dev "$server_veth" root netem $netem
+    # netem defaults to a 1,000-packet queue. That turns a requested loss
+    # test into an unintended burst-drop test after FEC increases wire PPS.
+    # Keep an explicitly requested limit, otherwise cover the largest
+    # qualified 100 ms-delay FEC burst without allowing host-wide effects.
+    if [[ " $netem " =~ [[:space:]]limit[[:space:]] ]]; then
+        netem_args=$netem
+    else
+        netem_args="$netem limit 32768"
+    fi
+    ip netns exec "$client_ns" tc qdisc replace dev "$client_veth" root netem $netem_args
+    ip netns exec "$server_ns" tc qdisc replace dev "$server_veth" root netem $netem_args
 fi
 
 ticks() {
@@ -182,7 +209,13 @@ profile_args() {
         nofec) printf '%s\0' --disable-fec ;;
         fec11) printf '%s\0' -f1:1 --mode 1 --timeout 0 ;;
         fec14) printf '%s\0' -f1:4 --mode 1 --timeout 0 ;;
-        adaptive) printf '%s\0' -f1:4 --mode 1 --timeout 0 --adaptive-fec --adaptive-feedback-ms 100 ;;
+        adaptive)
+            if [[ $use_perf -eq 1 ]]; then
+                printf '%s\0' -f1:4 --mode 1 --timeout 0 --adaptive-fec --adaptive-feedback-ms 100 --adaptive-fec-stats
+            else
+                printf '%s\0' -f1:4 --mode 1 --timeout 0 --adaptive-fec --adaptive-feedback-ms 100
+            fi
+            ;;
         *) echo "unknown profile: $1" >&2; exit 2 ;;
     esac
 }
@@ -207,6 +240,13 @@ run_case() {
         "${fec_args[@]}" --sock-buf 10240 --recvmmsg-batch "$receive_batch" "${send_args[@]}" --report 1 --disable-color --log-level 4 >"$dir/client.log" 2>&1 & client_pid=$!
     sleep 1
 
+    if [[ $use_perf -eq 1 ]]; then
+        perf record -q -o "$dir/client.perf.data" -F 499 -g --call-graph dwarf -p "$client_pid" -- sleep "$seconds" >"$dir/client-perf-record.log" 2>&1 & client_perf_record_pid=$!
+        perf record -q -o "$dir/server.perf.data" -F 499 -g --call-graph dwarf -p "$server_pid" -- sleep "$seconds" >"$dir/server-perf-record.log" 2>&1 & server_perf_record_pid=$!
+        perf stat -x, -o "$dir/client-perf-stat.csv" -e task-clock,context-switches,cpu-migrations,page-faults -p "$client_pid" -- sleep "$seconds" >"$dir/client-perf-stat.log" 2>&1 & client_perf_stat_pid=$!
+        perf stat -x, -o "$dir/server-perf-stat.csv" -e task-clock,context-switches,cpu-migrations,page-faults -p "$server_pid" -- sleep "$seconds" >"$dir/server-perf-stat.log" 2>&1 & server_perf_stat_pid=$!
+    fi
+
     local client_before server_before client_after server_after
     client_before=$(ticks "$client_pid")
     server_before=$(ticks "$server_pid")
@@ -221,6 +261,26 @@ run_case() {
     ip netns exec "$server_ns" tc -s qdisc show dev "$server_veth" >"$dir/server-qdisc-at-load.txt"
     ps -o pid,ni,stat,pcpu,comm -p "$client_pid","$server_pid","$echo_pid" >"$dir/process-at-load.txt"
     wait "$generator_pid"
+    for perf_pid in "$client_perf_record_pid" "$server_perf_record_pid" "$client_perf_stat_pid" "$server_perf_stat_pid"; do
+        [[ -n "$perf_pid" ]] && wait "$perf_pid" || true
+    done
+    if [[ $use_perf -eq 1 ]]; then
+        for role in client server; do
+            if [[ -s "$dir/$role.perf.data" ]]; then
+                perf script -i "$dir/$role.perf.data" >"$dir/$role.perf.script" 2>"$dir/$role-perf-script.log" || true
+                perf report --stdio -i "$dir/$role.perf.data" --percent-limit 0 >"$dir/$role.perf-report.txt" 2>&1 || true
+                # Keep raw stacks unconditionally. Render an SVG when the
+                # standard FlameGraph tools are available, but do not make
+                # qualification depend on a presentation-only dependency.
+                if command -v stackcollapse-perf.pl >/dev/null && command -v flamegraph.pl >/dev/null; then
+                    stackcollapse-perf.pl "$dir/$role.perf.script" >"$dir/$role.perf.folded" 2>"$dir/$role-flamegraph.log" || true
+                    flamegraph.pl --title "UDPspeeder $role" "$dir/$role.perf.folded" >"$dir/$role.flamegraph.svg" 2>>"$dir/$role-flamegraph.log" || true
+                else
+                    printf 'Raw perf script retained; install FlameGraph stackcollapse-perf.pl and flamegraph.pl to render SVG.\n' >"$dir/$role-flamegraph.log"
+                fi
+            fi
+        done
+    fi
     client_after=$(ticks "$client_pid")
     server_after=$(ticks "$server_pid")
     local clock_ticks client_cpu_ticks server_cpu_ticks
@@ -246,6 +306,8 @@ run_case() {
     ip netns exec "$server_ns" tc -s qdisc show dev "$server_veth" >"$dir/server-qdisc-final.txt"
     rg '\[report\]\[io\]' "$dir/client.log" >"$dir/client-batch-counters.txt" || true
     rg '\[report\]\[io\]' "$dir/server.log" >"$dir/server-batch-counters.txt" || true
+    rg '\[report\]\[adaptive-fec\]' "$dir/client.log" >"$dir/client-adaptive-fec-counters.txt" || true
+    rg '\[report\]\[adaptive-fec\]' "$dir/server.log" >"$dir/server-adaptive-fec-counters.txt" || true
     printf '%s ' "$case_name/run-$case_iteration" | tee -a "$out/summary.txt"
     tr '\n' ' ' <"$dir/generator.txt" | tee -a "$out/summary.txt"
     tr '\n' ' ' <"$dir/cpu.txt" | tee -a "$out/summary.txt"
@@ -255,13 +317,24 @@ run_case() {
     sleep 1
 }
 
-if [[ $matrix -eq 1 ]]; then
+if [[ $matrix -eq 1 && $knee -eq 1 ]]; then
+    echo "--matrix and --knee are mutually exclusive" >&2
+    exit 2
+elif [[ $matrix -eq 1 ]]; then
     for case_profile in nofec fec11 fec14 adaptive; do
         for case_payload in 256 512 1200; do
             for case_rate in 10000 25000 50000; do
-                for case_iteration in 1 2 3; do
+                for case_iteration in $(seq 1 "$repeat"); do
                     run_case "${case_profile}-${case_rate}pps-${case_payload}b-b${receive_batch}" "$case_profile" "$case_rate" "$case_payload" "$case_iteration"
                 done
+            done
+        done
+    done
+elif [[ $knee -eq 1 ]]; then
+    for case_payload in 256 512 1200; do
+        for case_rate in 10000 25000 50000 75000 100000; do
+            for case_iteration in $(seq 1 "$repeat"); do
+                run_case "${profile}-${case_rate}pps-${case_payload}b-b${receive_batch}" "$profile" "$case_rate" "$case_payload" "$case_iteration"
             done
         done
     done

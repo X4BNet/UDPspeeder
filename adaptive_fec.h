@@ -30,6 +30,28 @@ struct adaptive_fec_config_t {
 };
 
 extern adaptive_fec_config_t g_adaptive_fec_config;
+// Counters are intentionally opt-in.  They add a predictable branch to the
+// direct path, but must not add per-packet writes to a production tunnel.
+extern int adaptive_fec_statistics_enabled;
+
+struct adaptive_fec_statistics_t {
+    u64_t bypass_sent_packets = 0;
+    u64_t bypass_sent_payload_bytes = 0;
+    u64_t bypass_received_packets = 0;
+    u64_t bypass_received_payload_bytes = 0;
+    u64_t control_sent_packets = 0;
+    u64_t control_received_packets = 0;
+    u64_t mac_sent_packets = 0;
+    u64_t mac_sent_bytes = 0;
+    u64_t mac_received_packets = 0;
+    u64_t mac_received_bytes = 0;
+    u64_t profile_updates = 0;
+    u64_t state_transitions = 0;
+
+    void clear() {
+        memset(this, 0, sizeof(*this));
+    }
+};
 
 enum adaptive_fec_state_t {
     adaptive_fec_normal,
@@ -60,8 +82,10 @@ class adaptive_fec_controller_t : not_copy_able_t {
     u32_t control_sequence;
     u32_t bypass_sequence;
     int received_bypass_sequence;
-    u32_t last_received_bypass_sequence;
+    u32_t next_expected_bypass_sequence;
+    u64_t bypass_reorder_bits[4];
     fec_decode_stats_t window_stats;
+    adaptive_fec_statistics_t statistics;
 
     char control_buffer[128];
     char bypass_buffer[buf_len];
@@ -70,8 +94,13 @@ class adaptive_fec_controller_t : not_copy_able_t {
     void set_state(adaptive_fec_state_t new_state, const char *reason);
     void update_from_feedback(const fec_decode_stats_t &stats);
     void note_bypass_sequence(u32_t sequence);
+    int bypass_reorder_bit(int index) const;
+    void set_bypass_reorder_bit(int index);
+    void advance_bypass_reorder_window(int count);
     int build_hello(char *&data, int &len);
     int build_feedback(char *&data, int &len);
+    void append_mac(char *data, int &length);
+    int validate_mac(const char *data, int length);
 
    public:
     adaptive_fec_controller_t();
@@ -88,6 +117,7 @@ class adaptive_fec_controller_t : not_copy_able_t {
     int build_pending_control(char *&data, int &len);
     int build_bypass(char *payload, int payload_len, char *&data, int &len);
     adaptive_fec_inbound_result_t process_inbound(char *data, int len, char *&payload, int &payload_len);
+    void report_statistics(const char *role);
 };
 
 int adaptive_fec_unit_test();

@@ -15,7 +15,19 @@ void immediate_send_batch_t::clear() {
 int immediate_send_batch_t::flush() {
     if (count == 0) return 0;
 
-    int result = delay_send_batch(destination, data, len, delay, count);
+    int all_immediate = 1;
+    for (int i = 0; i < count; i++) {
+        if (delay[i] != 0) {
+            all_immediate = 0;
+            break;
+        }
+    }
+
+    // storage is owned by this batch and remains valid until this call
+    // returns, so there is no need to copy it into delay_manager's temporary
+    // immediate buffer.  Delayed output retains the original safe path.
+    int result = all_immediate ? send_immediate_batch_in_place(destination, data, len, count)
+                               : delay_send_batch(destination, data, len, delay, count);
     count = 0;
     return result;
 }

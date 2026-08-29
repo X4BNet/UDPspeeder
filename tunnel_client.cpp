@@ -239,7 +239,7 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
     conn_info.conv_manager.c.clear_inactive();
     mylog(log_trace, "events[idx].data.u64==(u64_t)conn_info.timer.get_timer_fd()\n");
 
-    conn_info.stat.report_as_client();
+    if (conn_info.stat.report_as_client()) conn_info.adaptive_fec.report_statistics("client");
 
     if (debug_force_flush_fec || conn_info.adaptive_fec.is_enabled()) {
         int out_n;

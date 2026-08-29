@@ -195,7 +195,7 @@ struct stat_t {
     void clear(){
         memset(this, 0, sizeof(stat_t));
     }
-    void report_as_client() {
+    int report_as_client() {
         if (report_interval != 0 && get_current_time() - last_report_time > u64_t(report_interval) * 1000) {
             last_report_time = get_current_time();
             inner_stat_t &a = normal_to_fec;
@@ -204,9 +204,11 @@ struct stat_t {
                   a.input_packet_num, a.input_packet_size, a.output_packet_num, a.output_packet_size,
                   b.output_packet_num, b.output_packet_size, b.input_packet_num, b.input_packet_size);
             report_io_batch_statistics("client");
+            return 1;
         }
+        return 0;
     }
-    void report_as_server(address_t &addr) {
+    int report_as_server(address_t &addr) {
         if (report_interval != 0 && get_current_time() - last_report_time > u64_t(report_interval) * 1000) {
             last_report_time = get_current_time();
             inner_stat_t &a = fec_to_normal;
@@ -216,7 +218,9 @@ struct stat_t {
                   a.output_packet_num, a.output_packet_size, a.input_packet_num, a.input_packet_size,
                   b.input_packet_num, b.input_packet_size, b.output_packet_num, b.output_packet_size);
             report_io_batch_statistics("server");
+            return 1;
         }
+        return 0;
     }
 };
 
