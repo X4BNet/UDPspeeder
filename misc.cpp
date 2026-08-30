@@ -42,6 +42,8 @@ int time_mono_test = 0;
 int delay_capacity = 0;
 
 int use_sendmmsg = 0;
+int use_udp_gso = 0;
+int udp_gso_max_segments = 32;
 
 char sub_net[100] = "10.22.22.0";
 u32_t sub_net_uint32 = 0;
@@ -313,6 +315,7 @@ int print_parameter() {
     mylog(log_info, "fec_str=%s\n", rs_par_str);
     mylog(log_info, "fec_inner_parameter=%s\n", g_fec_par.rs_to_str());
     mylog(log_info, "sendmmsg=%s\n", use_sendmmsg ? "enabled" : "disabled");
+    mylog(log_info, "udp_gso=%s segments=%d\n", use_udp_gso ? "enabled (experimental)" : "disabled", udp_gso_max_segments);
     mylog(log_info, "recvmmsg_batch=%d\n", get_receive_batch_size());
     if (g_adaptive_fec_config.enabled) {
         mylog(log_info, "adaptive_fec enabled: feedback_ms=%d recover_hold_ms=%d min_samples=%d\n",
@@ -399,9 +402,12 @@ int handle_command(char *s) {
 static void empty_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
 }
 int unit_test() {
+    assert(lru_collector_unit_test() == 0);
+    assert(packet_unit_test() == 0);
     assert(adaptive_fec_unit_test() == 0);
     assert(receive_batch_unit_test() == 0);
     assert(immediate_send_batch_unit_test() == 0);
+    assert(udp_gso_unit_test() == 0);
 
     // Exercise the encoder/decoder k=1 replication fast path, including
     // recovery from a parity-only mode-0 group and a mode-1 group.  The
@@ -786,6 +792,8 @@ void process_arg(int argc, char *argv[]) {
             {"adaptive-feedback-ms", required_argument, 0, 1},
             {"adaptive-recover-ms", required_argument, 0, 1},
             {"sendmmsg", no_argument, 0, 1},
+            {"udp-gso", no_argument, 0, 1},
+            {"udp-gso-segments", required_argument, 0, 1},
             {"recvmmsg-batch", required_argument, 0, 1},
             {"interval", required_argument, 0, 'i'},
             {NULL, 0, 0, 0}};
@@ -1096,6 +1104,25 @@ void process_arg(int argc, char *argv[]) {
                     use_sendmmsg = 1;
 #else
                     mylog(log_fatal, "--sendmmsg is only supported on Linux\n");
+                    myexit(-1);
+#endif
+                } else if (strcmp(long_options[option_index].name, "udp-gso") == 0) {
+#if defined(__linux__)
+                    use_udp_gso = 1;
+#else
+                    mylog(log_fatal, "--udp-gso is only supported on Linux\n");
+                    myexit(-1);
+#endif
+                } else if (strcmp(long_options[option_index].name, "udp-gso-segments") == 0) {
+#if defined(__linux__)
+                    use_udp_gso = 1;
+                    sscanf(optarg, "%d", &udp_gso_max_segments);
+                    if (udp_gso_max_segments < 2 || udp_gso_max_segments > 64) {
+                        mylog(log_fatal, "udp-gso-segments must be between 2 and 64\n");
+                        myexit(-1);
+                    }
+#else
+                    mylog(log_fatal, "--udp-gso-segments is only supported on Linux\n");
                     myexit(-1);
 #endif
                 } else if (strcmp(long_options[option_index].name, "recvmmsg-batch") == 0) {

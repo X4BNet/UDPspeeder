@@ -75,6 +75,23 @@ int do_obscure_old(const char *input, int in_len, char *output, int &out_len) {
     return 0;
 }
 
+namespace {
+
+// The IV is immediately after the payload, so source and destination do not
+// overlap. Processing complete IV spans eliminates the wrap branch from every
+// payload byte while retaining exactly the existing wire transformation.
+inline void xor_repeating_iv(char *data, const char *iv, int iv_len, int len) {
+    if (iv_len <= 0) return;
+    while (len >= iv_len) {
+        for (int i = 0; i < iv_len; i++) data[i] ^= iv[i];
+        data += iv_len;
+        len -= iv_len;
+    }
+    for (int i = 0; i < len; i++) data[i] ^= iv[i];
+}
+
+}  // namespace
+
 int do_obscure(char *data, int &len) {
     assert(len >= 0);
     assert(len < buf_len);
@@ -82,10 +99,7 @@ int do_obscure(char *data, int &len) {
     int iv_len = random_between(iv_min, iv_max);
     get_fake_random_chars(data + len, iv_len);
     data[iv_len + len] = (uint8_t)iv_len;
-    for (int i = 0, j = 0; i < len; i++, j++) {
-        if (j == iv_len) j = 0;
-        data[i] ^= data[len + j];
-    }
+    xor_repeating_iv(data, data + len, iv_len, len);
 
     len = len + iv_len + 1;
     return 0;
@@ -98,10 +112,7 @@ int de_obscure(char *data, int &len) {
     if (len < 1 + iv_len) return -1;
 
     len = len - 1 - iv_len;
-    for (int i = 0, j = 0; i < len; i++, j++) {
-        if (j == iv_len) j = 0;
-        data[i] ^= data[len + j];
-    }
+    xor_repeating_iv(data, data + len, iv_len, len);
 
     return 0;
 }
@@ -310,6 +321,32 @@ int rm_crc32(char *s, int &len) {
     u32_t crc32_in = read_u32(s + len);
     u32_t crc32 = (u32_t)crc32_fast(s, len);
     if (crc32 != crc32_in) return -1;
+    return 0;
+}
+
+int packet_unit_test() {
+    int saved_iv_min = iv_min;
+    int saved_iv_max = iv_max;
+    const int lengths[] = {0, 1, 7, 31, 128, 1200};
+    const int iv_lengths[] = {4, 8, 31, 32};
+    for (unsigned int iv_index = 0; iv_index < sizeof(iv_lengths) / sizeof(iv_lengths[0]); iv_index++) {
+        iv_min = iv_lengths[iv_index];
+        iv_max = iv_lengths[iv_index];
+        for (unsigned int length_index = 0; length_index < sizeof(lengths) / sizeof(lengths[0]); length_index++) {
+            char data[buf_len] = {};
+            char original[buf_len] = {};
+            int len = lengths[length_index];
+            for (int i = 0; i < len; i++) data[i] = (char)(i * 17 + 3);
+            memcpy(original, data, len);
+            assert(do_obscure(data, len) == 0);
+            assert(len == lengths[length_index] + iv_lengths[iv_index] + 1);
+            assert(de_obscure(data, len) == 0);
+            assert(len == lengths[length_index]);
+            assert(memcmp(data, original, len) == 0);
+        }
+    }
+    iv_min = saved_iv_min;
+    iv_max = saved_iv_max;
     return 0;
 }
 /*

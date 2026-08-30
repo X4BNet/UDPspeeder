@@ -140,10 +140,15 @@ struct delay_manager_t {
 };
 
 extern int use_sendmmsg;
+extern int use_udp_gso;
+// UDP GSO may contain up to 64 UDP datagrams, but a smaller value can avoid
+// turning an otherwise smooth output batch into an oversized receive burst.
+extern int udp_gso_max_segments;
 
 // Sends callback-owned packets synchronously.  Unlike delay_manager_t::add,
 // this does not take an ownership copy: callers must keep every buffer valid
 // through the call and must only use it for zero-delay packets.
 int send_immediate_batch_in_place(const dest_t &dest, char *const *data, int *len, int n);
+int udp_gso_unit_test();
 
 #endif /* DELAY_MANAGER_H_ */

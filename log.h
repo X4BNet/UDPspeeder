@@ -43,7 +43,15 @@ extern int enable_log_color;
 #define mylog(__first_argu__dummy_abcde__, ...) printf(__VA_ARGS__)
 
 #else
-#define mylog(...) log0(__FILE__, __FUNCTION__, __LINE__, __VA_ARGS__)
+// A function-level filter still evaluates every formatting argument before
+// log0() can reject the message.  Trace calls sit on the UDP packet path and
+// may format addresses or calculate diagnostics, so filter in the macro to
+// make disabled logging genuinely cold.
+#define mylog(level, ...)                           \
+    do {                                            \
+        if ((level) <= log_level)                   \
+            log0(__FILE__, __FUNCTION__, __LINE__, (level), __VA_ARGS__); \
+    } while (0)
 #endif
 
 //#define mylog(__first_argu__dummy_abcde__,...) {;}

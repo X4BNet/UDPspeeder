@@ -38,18 +38,22 @@ int get_receive_batch_size() {
 
 void report_io_batch_statistics(const char *role) {
     if (io_batch_statistics.recvmmsg_calls == 0 && io_batch_statistics.sendmmsg_calls == 0 &&
-        io_batch_statistics.sendmmsg_fallback_packets == 0)
+        io_batch_statistics.sendmmsg_fallback_packets == 0 && io_batch_statistics.udp_gso_calls == 0 &&
+        io_batch_statistics.udp_gso_fallback_packets == 0)
         return;
 
     mylog(log_info,
           "[report][io][%s] recv_batch:calls=%llu packets=%llu eagain=%llu fallback=%llu "
-          "send_batch:calls=%llu packets=%llu partial=%llu eagain=%llu fallback_packets=%llu\n",
+          "send_batch:calls=%llu packets=%llu partial=%llu eagain=%llu fallback_packets=%llu "
+          "udp_gso:calls=%llu packets=%llu bytes=%llu partial=%llu fallback_packets=%llu\n",
           role,
           io_batch_statistics.recvmmsg_calls, io_batch_statistics.recvmmsg_packets,
           io_batch_statistics.recvmmsg_eagain, io_batch_statistics.recvmmsg_fallbacks,
           io_batch_statistics.sendmmsg_calls, io_batch_statistics.sendmmsg_packets,
           io_batch_statistics.sendmmsg_partial_calls, io_batch_statistics.sendmmsg_eagain,
-          io_batch_statistics.sendmmsg_fallback_packets);
+          io_batch_statistics.sendmmsg_fallback_packets, io_batch_statistics.udp_gso_calls,
+          io_batch_statistics.udp_gso_packets, io_batch_statistics.udp_gso_bytes,
+          io_batch_statistics.udp_gso_partial_calls, io_batch_statistics.udp_gso_fallback_packets);
     io_batch_statistics.clear();
 }
 

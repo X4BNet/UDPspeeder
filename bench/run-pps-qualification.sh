@@ -23,6 +23,9 @@ Options:
   --repeat N                repetitions of this case (default: 5)
   --recvmmsg-batch N        1..64 (default: 1)
   --sendmmsg                enable UDPspeeder's opt-in send batching
+  --udp-gso                 enable experimental UDP segmentation for equal-size batches
+  --udp-gso-segments N      cap UDP datagrams per GSO packet, 2..64 (default: 32)
+  --endpoint MODE           echo (default, round-trip RTT) or sink (one-way forwarding PPS)
   --perf                    capture client/server software perf profiles
   --cpus E,S,C,TX,RX        echo, server, client, sender, receiver CPU ids (default: 0,1,2,3,4)
   --netem ARGS              e.g. 'loss 1% delay 20ms 5ms'; applied to both veth egresses
@@ -46,6 +49,9 @@ seconds=10
 repeat=5
 receive_batch=1
 use_sendmmsg=0
+use_udp_gso=0
+udp_gso_segments=32
+endpoint=echo
 use_perf=0
 netem=
 matrix=0
@@ -69,6 +75,9 @@ while [[ $# -gt 0 ]]; do
         --repeat) repeat=$2; shift 2 ;;
         --recvmmsg-batch) receive_batch=$2; shift 2 ;;
         --sendmmsg) use_sendmmsg=1; shift ;;
+        --udp-gso) use_udp_gso=1; shift ;;
+        --udp-gso-segments) use_udp_gso=1; udp_gso_segments=$2; shift 2 ;;
+        --endpoint) endpoint=$2; shift 2 ;;
         --perf) use_perf=1; shift ;;
         --cpus)
             IFS=, read -r echo_cpu server_cpu client_cpu sender_cpu receiver_cpu <<<"$2"
@@ -94,6 +103,7 @@ if [[ -z "$server_binary" ]]; then server_binary=$binary; else server_binary=$(r
 [[ -x "$client_binary" ]] || { echo "not executable: $client_binary" >&2; exit 2; }
 [[ -x "$server_binary" ]] || { echo "not executable: $server_binary" >&2; exit 2; }
 [[ "$receive_batch" =~ ^[0-9]+$ ]] && ((receive_batch >= 1 && receive_batch <= 64)) || { echo "invalid --recvmmsg-batch" >&2; exit 2; }
+[[ "$endpoint" == echo || "$endpoint" == sink ]] || { echo "--endpoint must be echo or sink" >&2; exit 2; }
 if [[ $use_perf -eq 1 ]]; then
     command -v perf >/dev/null || { echo "--perf requires perf" >&2; exit 2; }
 fi
@@ -108,6 +118,7 @@ mkdir -p "$out/bin"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cc -O2 -Wall -Wextra -Werror -o "$out/bin/udp_echo" "$root/bench/udp_echo.c"
+cc -O2 -Wall -Wextra -Werror -o "$out/bin/udp_sink" "$root/bench/udp_sink.c"
 cc -O2 -Wall -Wextra -Werror -pthread -o "$out/bin/udp_pps_generator" "$root/bench/udp_pps_generator.c"
 
 run_id=$$
@@ -165,7 +176,8 @@ ip -n "$server_ns" link set "$server_veth" up
     "$client_binary" --help | sed -n '1,8p'
     if [[ $use_perf -eq 1 ]]; then perf --version; fi
     sysctl -n net.core.rmem_max net.core.wmem_max
-    printf 'cpus=echo:%s server:%s client:%s sender:%s receiver:%s\n' "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"
+    printf 'endpoint=%s udp_gso=%s udp_gso_segments=%s cpus=endpoint:%s server:%s client:%s sender:%s receiver:%s\n' \
+        "$endpoint" "$use_udp_gso" "$udp_gso_segments" "$echo_cpu" "$server_cpu" "$client_cpu" "$sender_cpu" "$receiver_cpu"
 } >"$out/environment.txt"
 
 if [[ -n "$netem" ]]; then
@@ -232,8 +244,14 @@ run_case() {
     mkdir -p "$dir"
     mapfile -d '' fec_args < <(profile_args "$case_profile")
     [[ $use_sendmmsg -eq 1 ]] && send_args+=(--sendmmsg)
+    [[ $use_udp_gso -eq 1 ]] && send_args+=(--udp-gso --udp-gso-segments "$udp_gso_segments")
 
-    ip netns exec "$server_ns" taskset -c "$echo_cpu" "$out/bin/udp_echo" "$server_ip" 41000 >"$dir/echo.log" 2>&1 & echo_pid=$!
+    if [[ $endpoint == sink ]]; then
+        local expected_packets=$((case_rate * seconds * 2 + 1024))
+        ip netns exec "$server_ns" taskset -c "$echo_cpu" "$out/bin/udp_sink" "$server_ip" 41000 "$expected_packets" >"$dir/sink.log" 2>&1 & echo_pid=$!
+    else
+        ip netns exec "$server_ns" taskset -c "$echo_cpu" "$out/bin/udp_echo" "$server_ip" 41000 >"$dir/echo.log" 2>&1 & echo_pid=$!
+    fi
     ip netns exec "$server_ns" taskset -c "$server_cpu" "$server_binary" -s -l"$server_ip":41001 -r"$server_ip":41000 \
         "${fec_args[@]}" --sock-buf 10240 --recvmmsg-batch "$receive_batch" "${send_args[@]}" --report 1 --disable-color --log-level 4 >"$dir/server.log" 2>&1 & server_pid=$!
     ip netns exec "$client_ns" taskset -c "$client_cpu" "$client_binary" -c -l"$client_ip":41002 -r"$server_ip":41001 \
@@ -252,15 +270,26 @@ run_case() {
     server_before=$(ticks "$server_pid")
     capture_interface_counters "$client_ns" "$client_veth" "$dir/client-interface-before.txt"
     capture_interface_counters "$server_ns" "$server_veth" "$dir/server-interface-before.txt"
-    ip netns exec "$client_ns" "$out/bin/udp_pps_generator" "$client_ip" 41002 "$case_rate" "$seconds" "$case_payload" "$sender_cpu" "$receiver_cpu" >"$dir/generator.txt" 2>&1 &
+    local -a generator_args=("$client_ip" 41002 "$case_rate" "$seconds" "$case_payload" "$sender_cpu" "$receiver_cpu")
+    [[ $endpoint == sink ]] && generator_args+=(--one-way)
+    ip netns exec "$client_ns" "$out/bin/udp_pps_generator" "${generator_args[@]}" >"$dir/generator.txt" 2>&1 &
     local generator_pid=$!
     sleep 2
     ip netns exec "$client_ns" ss -u -a -n -m >"$dir/client-sockets-at-load.txt"
     ip netns exec "$server_ns" ss -u -a -n -m >"$dir/server-sockets-at-load.txt"
     ip netns exec "$client_ns" tc -s qdisc show dev "$client_veth" >"$dir/client-qdisc-at-load.txt"
     ip netns exec "$server_ns" tc -s qdisc show dev "$server_veth" >"$dir/server-qdisc-at-load.txt"
-    ps -o pid,ni,stat,pcpu,comm -p "$client_pid","$server_pid","$echo_pid" >"$dir/process-at-load.txt"
+    ps -L -o pid,lwp,psr,ni,stat,pcpu,comm -p "$client_pid","$server_pid","$echo_pid" >"$dir/process-at-load.txt"
     wait "$generator_pid"
+    if [[ $endpoint == sink ]]; then
+        # The generator stops at its scheduled send boundary. Let the two
+        # speeder processes drain their already accepted packets before the
+        # sequence-counting endpoint emits its result.
+        sleep 1
+        kill -TERM "$echo_pid" 2>/dev/null || true
+        wait "$echo_pid" 2>/dev/null || true
+        echo_pid=
+    fi
     for perf_pid in "$client_perf_record_pid" "$server_perf_record_pid" "$client_perf_stat_pid" "$server_perf_stat_pid"; do
         [[ -n "$perf_pid" ]] && wait "$perf_pid" || true
     done
@@ -308,8 +337,9 @@ run_case() {
     rg '\[report\]\[io\]' "$dir/server.log" >"$dir/server-batch-counters.txt" || true
     rg '\[report\]\[adaptive-fec\]' "$dir/client.log" >"$dir/client-adaptive-fec-counters.txt" || true
     rg '\[report\]\[adaptive-fec\]' "$dir/server.log" >"$dir/server-adaptive-fec-counters.txt" || true
-    printf '%s ' "$case_name/run-$case_iteration" | tee -a "$out/summary.txt"
+    printf '%s endpoint=%s ' "$case_name/run-$case_iteration" "$endpoint" | tee -a "$out/summary.txt"
     tr '\n' ' ' <"$dir/generator.txt" | tee -a "$out/summary.txt"
+    if [[ $endpoint == sink ]]; then tr '\n' ' ' <"$dir/sink.log" | tee -a "$out/summary.txt"; fi
     tr '\n' ' ' <"$dir/cpu.txt" | tee -a "$out/summary.txt"
     tr '\n' ' ' <"$dir/wire.txt" | tee -a "$out/summary.txt"
     printf '\n' | tee -a "$out/summary.txt"

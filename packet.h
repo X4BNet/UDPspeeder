@@ -44,4 +44,5 @@ int put_crc32(char *s, int &len);
 int rm_crc32(char *s, int &len);
 int do_cook(char *data, int &len);
 int de_cook(char *s, int &len);
+int packet_unit_test();
 #endif /* PACKET_H_ */

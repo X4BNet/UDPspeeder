@@ -446,6 +446,19 @@ struct not_copy_able_t {
     }
 };
 
+// libev refreshes ev_now() after every poll. Conversation expiry is measured
+// in seconds (and cleaned once per second), so the loop-cached clock is the
+// right precision for packet-path LRU activity and avoids a wall-clock read
+// for every datagram. Keep the original monotonic behaviour if the wall clock
+// moves backwards.
+inline my_time_t get_lru_current_time() {
+    static my_time_t largest_value = 0;
+    my_time_t value = (my_time_t)(ev_now(ev_default_loop(0)) * 1000.0);
+    if (value < largest_value) return largest_value;
+    largest_value = value;
+    return value;
+}
+
 template <class key_t>
 struct lru_collector_t : not_copy_able_t {
     // typedef void* key_t;
@@ -459,26 +472,30 @@ struct lru_collector_t : not_copy_able_t {
 
     list<lru_pair_t> q;
     int update(key_t key) {
-        assert(mp.find(key) != mp.end());
-        auto it = mp[key];
-        q.erase(it);
-
-        my_time_t value = get_current_time();
+        auto map_it = mp.find(key);
+        assert(map_it != mp.end());
+        auto queue_it = map_it->second;
+        my_time_t value = get_lru_current_time();
+        // get_current_time() is millisecond-granular. Repeating the update
+        // within the same tick cannot change expiry time, so it must not pay
+        // another list relink on the packet hot path.
+        if (queue_it->ts == value) return 0;
         if (!q.empty()) {
             assert(value >= q.front().ts);
         }
-        lru_pair_t tmp;
-        tmp.key = key;
-        tmp.ts = value;
-        q.push_front(tmp);
-        mp[key] = q.begin();
+        // A conversation update must retain exact LRU semantics, but it need
+        // not erase and allocate a node on every UDP packet. splice keeps the
+        // iterator valid and relinks the existing node in O(1).
+        queue_it->ts = value;
+        q.splice(q.begin(), q, queue_it);
+        map_it->second = q.begin();
 
         return 0;
     }
     int new_key(key_t key) {
         assert(mp.find(key) == mp.end());
 
-        my_time_t value = get_current_time();
+        my_time_t value = get_lru_current_time();
         if (!q.empty()) {
             assert(value >= q.front().ts);
         }
@@ -526,6 +543,8 @@ struct lru_collector_t : not_copy_able_t {
             erase(key);
     }*/
 };
+
+int lru_collector_unit_test();
 
 vector<string> string_to_vec(const char *s, const char *sp);
 

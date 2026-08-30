@@ -449,6 +449,25 @@ u64_t get_current_time() {
     return get_current_time_us() / 1000lu;
 }
 
+int lru_collector_unit_test() {
+    lru_collector_t<u32_t> collector;
+    collector.new_key(1);
+    collector.new_key(2);
+
+    u32_t oldest = 0;
+    assert(collector.peek_back(oldest) <= get_lru_current_time());
+    assert(oldest == 1);
+
+    collector.update(1);
+    assert(collector.peek_back(oldest) <= get_lru_current_time());
+    // A same-millisecond update keeps the existing order because both
+    // entries have identical expiry precision and no relink is needed.
+    assert(oldest == 1);
+    collector.erase(2);
+    assert(collector.size() == 1);
+    return 0;
+}
+
 u64_t pack_u64(u32_t a, u32_t b) {
     u64_t ret = a;
     ret <<= 32u;

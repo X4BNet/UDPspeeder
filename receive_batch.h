@@ -26,6 +26,12 @@ struct io_batch_statistics_t {
     u64_t sendmmsg_eagain = 0;
     u64_t sendmmsg_fallback_packets = 0;
 
+    u64_t udp_gso_calls = 0;
+    u64_t udp_gso_packets = 0;
+    u64_t udp_gso_bytes = 0;
+    u64_t udp_gso_partial_calls = 0;
+    u64_t udp_gso_fallback_packets = 0;
+
     void clear();
 };
 

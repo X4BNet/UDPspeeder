@@ -280,7 +280,9 @@ struct conn_info_t : not_copy_able_t  // stores info for a raw connection.for cl
             ev_timer_stop(loop, &timer);
     }
     void update_active_time() {
-        last_active_time = get_current_time();
+        // Connection collection is second-scale; avoid a wall-clock read for
+        // every datagram and keep it in step with the LRU activity clock.
+        last_active_time = get_lru_current_time();
     }
     /*
     conn_info_t(const conn_info_t &b)

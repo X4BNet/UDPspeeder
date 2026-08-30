@@ -72,6 +72,8 @@ static void print_help() {
     printf("    --adaptive-recover-ms <number>        clean-link hold before normal, 1000..60000ms, default 10000ms\n");
 #ifdef __linux__
     printf("    --sendmmsg                            opt-in batch sends for ready FEC/delay groups\n");
+    printf("    --udp-gso                             experimental UDP segmentation for equal-size ready batches (32 segments)\n");
+    printf("    --udp-gso-segments  <number>          UDP datagrams per GSO packet, 2..64, default: 32\n");
     printf("    --recvmmsg-batch      <number>        opt-in receive batch size, 1 (default) keeps one receive per callback\n");
 #endif
     printf("    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024\n");

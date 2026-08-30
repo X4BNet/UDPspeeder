@@ -30,6 +30,7 @@ struct generator_state {
     volatile int sender_done;
     int sender_cpu;
     int receiver_cpu;
+    int one_way;
 };
 
 static uint64_t now_ns(void) {
@@ -129,8 +130,14 @@ static void *receive_packets(void *opaque) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6 && argc != 8) {
-        fprintf(stderr, "usage: %s target_ip port pps seconds payload_bytes [sender_cpu receiver_cpu]\n", argv[0]);
+    int positional_count = argc;
+    int one_way = 0;
+    if (argc > 1 && strcmp(argv[argc - 1], "--one-way") == 0) {
+        one_way = 1;
+        positional_count--;
+    }
+    if (positional_count != 6 && positional_count != 8) {
+        fprintf(stderr, "usage: %s target_ip port pps seconds payload_bytes [sender_cpu receiver_cpu] [--one-way]\n", argv[0]);
         return 2;
     }
 
@@ -146,7 +153,8 @@ int main(int argc, char **argv) {
     state.duration_ns = seconds * 1000000000ULL;
     state.sender_cpu = -1;
     state.receiver_cpu = -1;
-    if (argc == 8) {
+    state.one_way = one_way;
+    if (positional_count == 8) {
         state.sender_cpu = atoi(argv[6]);
         state.receiver_cpu = atoi(argv[7]);
     }
@@ -183,12 +191,26 @@ int main(int argc, char **argv) {
 
     pthread_t sender;
     pthread_t receiver;
-    if (pthread_create(&receiver, 0, receive_packets, &state) != 0 || pthread_create(&sender, 0, send_packets, &state) != 0) {
+    if ((!state.one_way && pthread_create(&receiver, 0, receive_packets, &state) != 0) ||
+        pthread_create(&sender, 0, send_packets, &state) != 0) {
         fprintf(stderr, "pthread_create failed\n");
         return 1;
     }
     pthread_join(sender, 0);
-    pthread_join(receiver, 0);
+    if (!state.one_way) pthread_join(receiver, 0);
+
+    if (state.one_way) {
+        double elapsed_seconds = (state.sender_end_ns - state.sender_start_ns) / 1000000000.0;
+        double actual_pps = elapsed_seconds > 0 ? state.sent / elapsed_seconds : 0;
+        printf("sent=%llu payload_bytes=%llu one_way=1 actual_pps=%.0f payload_mbit=%.2f\n",
+               (unsigned long long)state.sent, (unsigned long long)(state.sent * (uint64_t)state.payload_bytes), actual_pps,
+               actual_pps * state.payload_bytes * 8.0 / 1000000.0);
+        close(state.fd);
+        free(state.received);
+        free(state.latency_ns);
+        free(state.sent_at_ns);
+        return 0;
+    }
 
     qsort(state.latency_ns, state.unique_received, sizeof(*state.latency_ns), compare_u64);
     double elapsed_seconds = (state.sender_end_ns - state.sender_start_ns) / 1000000000.0;
