@@ -4,6 +4,27 @@
 #include "log.h"
 #include "misc.h"
 
+namespace {
+
+int same_destination(const dest_t &a, const dest_t &b) {
+    if (a.type != b.type || a.cook != b.cook) return 0;
+    switch (a.type) {
+        case type_fd64:
+            return a.inner.fd64 == b.inner.fd64;
+        case type_fd:
+        case type_write_fd:
+            return a.inner.fd == b.inner.fd;
+        case type_fd64_addr:
+            return a.inner.fd64_addr.fd64 == b.inner.fd64_addr.fd64 && a.inner.fd64_addr.addr == b.inner.fd64_addr.addr;
+        case type_fd_addr:
+            return a.inner.fd_addr.fd == b.inner.fd_addr.fd && a.inner.fd_addr.addr == b.inner.fd_addr.addr;
+        default:
+            return 0;
+    }
+}
+
+}  // namespace
+
 immediate_send_batch_t::immediate_send_batch_t() : count(0) {
     destination = dest_t();
 }
@@ -41,6 +62,7 @@ int immediate_send_batch_t::add(my_time_t packet_delay, const dest_t &dest, cons
         return -1;
     }
 
+    if (count != 0 && !same_destination(destination, dest) && flush() != 0) return -1;
     if (count == capacity && flush() != 0) return -1;
 
     if (count == 0) destination = dest;
@@ -54,8 +76,9 @@ int immediate_send_batch_t::add(my_time_t packet_delay, const dest_t &dest, cons
 
 int immediate_send_batch_unit_test() {
     int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    int other_receiver = socket(AF_INET, SOCK_DGRAM, 0);
     int sender = socket(AF_INET, SOCK_DGRAM, 0);
-    assert(receiver >= 0 && sender >= 0);
+    assert(receiver >= 0 && other_receiver >= 0 && sender >= 0);
 
     sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -65,6 +88,14 @@ int immediate_send_batch_unit_test() {
     assert(bind(receiver, (sockaddr *)&address, sizeof(address)) == 0);
     socklen_t address_len = sizeof(address);
     assert(getsockname(receiver, (sockaddr *)&address, &address_len) == 0);
+
+    sockaddr_in other_address;
+    memset(&other_address, 0, sizeof(other_address));
+    other_address.sin_family = AF_INET;
+    other_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(other_receiver, (sockaddr *)&other_address, sizeof(other_address)) == 0);
+    socklen_t other_address_len = sizeof(other_address);
+    assert(getsockname(other_receiver, (sockaddr *)&other_address, &other_address_len) == 0);
 
     dest_t dest = {};
     dest.type = type_fd_addr;
@@ -95,9 +126,27 @@ int immediate_send_batch_unit_test() {
     assert(io_batch_statistics.sendmmsg_packets == 3);
 #endif
 
+    // A server's recvmmsg callback can include packets from separate
+    // UDPspeeder clients. Verify that staging does not send a later client's
+    // packet through the first client's connected upper-level socket.
+    dest_t other_dest = dest;
+    other_dest.inner.fd_addr.addr.from_sockaddr((sockaddr *)&other_address, other_address_len);
+    assert(batch.add(0, dest, "first-destination", 17) == 0);
+    assert(batch.add(0, other_dest, "second-destination", 18) == 0);
+    assert(batch.flush() == 0);
+
+    char received[32];
+    int received_len = recv(receiver, received, sizeof(received), 0);
+    assert(received_len == 17);
+    assert(memcmp(received, "first-destination", received_len) == 0);
+    received_len = recv(other_receiver, received, sizeof(received), 0);
+    assert(received_len == 18);
+    assert(memcmp(received, "second-destination", received_len) == 0);
+
     io_batch_statistics = saved_statistics;
     use_sendmmsg = saved_sendmmsg;
     close(sender);
+    close(other_receiver);
     close(receiver);
     return 0;
 }

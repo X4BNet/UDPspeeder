@@ -71,6 +71,10 @@ class adaptive_fec_controller_t : not_copy_able_t {
     adaptive_fec_config_t config;
     adaptive_fec_state_t state;
     int peer_capable;
+    // Keep the configured static FEC profile until the peer has reported one
+    // real decode window.  Capability negotiation alone says nothing about
+    // whether the path is safe for an unprotected OpenVPN bootstrap packet.
+    int normal_profile_validated;
     int profile_dirty;
     int hello_response_pending;
     int bypass_active_logged;

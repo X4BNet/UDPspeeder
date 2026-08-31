@@ -171,6 +171,7 @@ adaptive_fec_controller_t::adaptive_fec_controller_t() {
     config = g_adaptive_fec_config;
     state = adaptive_fec_normal;
     peer_capable = 0;
+    normal_profile_validated = 0;
     profile_dirty = 0;
     hello_response_pending = 0;
     bypass_active_logged = 0;
@@ -236,7 +237,7 @@ void adaptive_fec_controller_t::set_state(adaptive_fec_state_t new_state, const 
 }
 
 int adaptive_fec_controller_t::can_bypass() const {
-    return config.enabled && peer_capable && state == adaptive_fec_normal && profile_has_no_redundancy(config.normal);
+    return config.enabled && peer_capable && normal_profile_validated && state == adaptive_fec_normal && profile_has_no_redundancy(config.normal);
 }
 
 int adaptive_fec_controller_t::take_profile_update(fec_parameter_t &profile) {
@@ -474,7 +475,6 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         }
         if (!peer_capable) {
             peer_capable = 1;
-            profile_dirty = 1;
             // Reply exactly once to a newly discovered peer. Re-acknowledging
             // every compatible legacy probe creates an idle control ping-pong
             // and adds an avoidable packet beside each direct-bypass payload.
@@ -496,7 +496,6 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
     if (kind == adaptive_fec_hello) {
         if (!peer_capable) {
             peer_capable = 1;
-            profile_dirty = 1;
             hello_response_pending = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
@@ -519,8 +518,16 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         stats.reordered_packets = read_u32(data + offset);
         if (!peer_capable) {
             peer_capable = 1;
-            profile_dirty = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
+        }
+        // Do not put a new tunnel into the zero-redundancy normal profile
+        // merely because it can parse control frames.  A feedback frame means
+        // the receiver has successfully observed the current FEC-protected
+        // traffic, so it is now safe to select the adaptive profile.
+        if (!normal_profile_validated) {
+            normal_profile_validated = 1;
+            profile_dirty = 1;
+            mylog(log_info, "adaptive-fec initial receiver feedback confirmed\n");
         }
         update_from_feedback(stats);
         if (adaptive_fec_statistics_enabled) statistics.control_received_packets++;
@@ -533,8 +540,14 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         }
         if (!peer_capable) {
             peer_capable = 1;
-            profile_dirty = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
+        }
+        // Accept a direct frame from an earlier implementation as proof that
+        // its sender already selected the normal profile.  Current peers
+        // reach this only after the feedback gate above.
+        if (!normal_profile_validated) {
+            normal_profile_validated = 1;
+            profile_dirty = 1;
         }
         note_bypass_sequence(read_u32(data + adaptive_fec_header_len));
         payload = data + adaptive_fec_bypass_header_len;
@@ -601,13 +614,27 @@ int adaptive_fec_unit_test() {
     assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
     assert(receiver.build_pending_control(control, control_len) == 1);
     assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
-    assert(sender.can_bypass());
+    // Capability negotiation must retain the configured profile for the
+    // startup/control exchange.  It becomes eligible for the direct path
+    // only after the receiver returns actual FEC decode feedback.
+    assert(!sender.can_bypass());
+    fec_parameter_t pending_profile;
+    assert(sender.take_profile_update(pending_profile) == 0);
     // The initiator may send one acknowledgement for the responder's first
     // capability probe. The responder must not acknowledge that acknowledgement
     // forever.
     assert(sender.build_pending_control(control, control_len) == 1);
     assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
     assert(receiver.build_pending_control(control, control_len) == 0);
+
+    fec_decode_stats_t initial_stats;
+    initial_stats.delivered_packets = 1;
+    receiver.observe_decoder_stats(initial_stats);
+    assert(receiver.build_pending_control(control, control_len) == 1);
+    assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
+    assert(sender.can_bypass());
+    assert(sender.take_profile_update(pending_profile) == 1);
+    assert(profile_has_no_redundancy(pending_profile));
 
     char test_payload[] = "adaptive-fec-bypass";
     assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);

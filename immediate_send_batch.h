@@ -23,9 +23,8 @@ class immediate_send_batch_t : not_copy_able_t {
    public:
     immediate_send_batch_t();
 
-    // Packets remain in arrival order. A UDPspeeder instance has one egress
-    // destination for a callback, so the first packet establishes the batch
-    // destination and subsequent packets only need to be copied.
+    // Packets remain in arrival order. A destination change flushes the
+    // current batch before starting the next one.
     int add(my_time_t packet_delay, const dest_t &dest, const char *packet, int packet_len);
     int flush();
     void clear();

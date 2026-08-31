@@ -148,9 +148,11 @@ log and help options:
 its control frames use the built-in `UDPspeeder-adaptive-fec-v1` compatibility
 key; this is not a secret and provides no authentication against a party that
 knows the implementation. Production peers must use a matching, high-entropy
-`-k/--key` of at least 16 bytes. It starts with the normal state and uses a direct packet fast path when the normal profile has no
-redundancy. The receiver reports delivered, recovered, unrecoverable, and
-reordered packet observations to its sender. The sender moves through
+`-k/--key` of at least 16 bytes. It retains the configured static FEC profile
+until the first receiver feedback window, protecting connection setup and
+other sparse control traffic. It then uses a direct packet fast path when the
+normal profile has no redundancy. The receiver reports delivered, recovered,
+unrecoverable, and reordered packet observations to its sender. The sender moves through
 `normal`, `guard`, `degraded`, and `recover`; it holds the recover state before
 returning to normal, preventing rapid FEC flapping.
 
