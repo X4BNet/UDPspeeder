@@ -98,11 +98,13 @@ int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, 
 
         fec_parameter_t updated_profile;
         if (conn_info.adaptive_fec.take_profile_update(updated_profile)) {
-            conn_info.fec_encode_manager.request_fec_parameter(updated_profile);
+            conn_info.deferred_fec_profile.clone(updated_profile);
+            conn_info.has_deferred_fec_profile = 1;
         }
 
         int direct_bypass = 0;
-        if (data != 0 && conn_info.adaptive_fec.can_bypass() && conn_info.fec_encode_manager.is_idle()) {
+        if (data != 0 && conn_info.adaptive_fec.can_bypass() &&
+            (conn_info.fec_encode_manager == 0 || conn_info.fec_encode_manager->is_idle())) {
             char *bypass_data = 0;
             int bypass_data_len = 0;
             if (conn_info.adaptive_fec.build_bypass(data, len, bypass_data, bypass_data_len) == 0) {
@@ -119,13 +121,24 @@ int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, 
         }
 
         if (!direct_bypass) {
-            if (data == 0 && conn_info.fec_encode_manager.is_idle()) {
+            if (data == 0 && conn_info.fec_encode_manager == 0) {
                 out_n = 0;
                 out_arr = 0;
                 out_len = 0;
             } else {
-                conn_info.fec_encode_manager.input(data, len);
-                conn_info.fec_encode_manager.output(out_n, out_arr, out_len);
+                fec_encode_manager_t &encoder = conn_info.ensure_fec_encode_manager();
+                if (conn_info.has_deferred_fec_profile) {
+                    encoder.request_fec_parameter(conn_info.deferred_fec_profile);
+                    conn_info.has_deferred_fec_profile = 0;
+                }
+                if (data == 0 && encoder.is_idle()) {
+                    out_n = 0;
+                    out_arr = 0;
+                    out_len = 0;
+                } else {
+                    encoder.input(data, len);
+                    encoder.output(out_n, out_arr, out_len);
+                }
                 if (out_n < 0) out_n = 0;
             }
         }
@@ -133,14 +146,14 @@ int from_normal_to_fec(conn_info_t &conn_info, char *data, int len, int &out_n, 
         if (out_n > 0) {
             my_time_t common_latency = 0;
 
-            if (!direct_bypass && fix_latency == 1 && conn_info.fec_encode_manager.get_type() == 0) {
+            if (!direct_bypass && conn_info.fec_encode_manager != 0 && fix_latency == 1 && conn_info.fec_encode_manager->get_type() == 0) {
                 my_time_t current_time = get_current_time_us();
-                my_time_t first_packet_time = conn_info.fec_encode_manager.get_first_packet_time();
+                my_time_t first_packet_time = conn_info.fec_encode_manager->get_first_packet_time();
                 my_time_t tmp;
                 assert(first_packet_time != 0);
                 // mylog(log_info,"current_time=%llu first_packlet_time=%llu   fec_pending_time=%llu\n",current_time,first_packet_time,(my_time_t)fec_pending_time);
-                if ((my_time_t)conn_info.fec_encode_manager.get_pending_time() >= (current_time - first_packet_time)) {
-                    tmp = (my_time_t)conn_info.fec_encode_manager.get_pending_time() - (current_time - first_packet_time);
+                if ((my_time_t)conn_info.fec_encode_manager->get_pending_time() >= (current_time - first_packet_time)) {
+                    tmp = (my_time_t)conn_info.fec_encode_manager->get_pending_time() - (current_time - first_packet_time);
                     // mylog(log_info,"tmp=%llu\n",tmp);
                 } else {
                     tmp = 0;
@@ -246,14 +259,15 @@ int from_fec_to_normal(conn_info_t &conn_info, char *data, int len, int &out_n, 
             inner_stat.output_packet_num++;
             inner_stat.output_packet_size += bypass_payload_len;
         } else {
-            conn_info.fec_decode_manager.input(data, len);
-            conn_info.fec_decode_manager.expire_incomplete_groups(g_adaptive_fec_config.enabled ? g_adaptive_fec_config.incomplete_group_timeout_us : 0);
+            fec_decode_manager_t &decoder = conn_info.ensure_fec_decode_manager();
+            decoder.input(data, len);
+            decoder.expire_incomplete_groups(g_adaptive_fec_config.enabled ? g_adaptive_fec_config.incomplete_group_timeout_us : fec_incomplete_group_timeout_us);
 
             fec_decode_stats_t decoder_stats;
-            conn_info.fec_decode_manager.take_statistics(decoder_stats);
+            decoder.take_statistics(decoder_stats);
             conn_info.adaptive_fec.observe_decoder_stats(decoder_stats);
 
-            conn_info.fec_decode_manager.output(out_n, out_arr, out_len);
+            decoder.output(out_n, out_arr, out_len);
             if (out_n < 0) out_n = 0;
             for (int i = 0; i < out_n; i++) {
                 out_delay_buf[i] = 0;
@@ -411,8 +425,8 @@ int unit_test() {
 
     // Exercise the encoder/decoder k=1 replication fast path, including
     // recovery from a parity-only mode-0 group and a mode-1 group.  The
-    // manager owns fixed send/receive buffers, so this also guards the
-    // allocation-free hot path used by short adaptive-FEC groups.
+    // manager can release its dynamic send/receive buffers again, so this
+    // also guards the compact hot path used by short adaptive-FEC groups.
     {
         fec_parameter_t saved_fec = g_fec_par;
         char k1_profile[] = "1:4";
@@ -500,6 +514,49 @@ int unit_test() {
         delete decoder;
         delete encoder;
         g_fec_par = saved_fec;
+    }
+    {
+        // Invalid frames must not pass server admission, while valid but
+        // incomplete groups use exact-size storage and remain hard-capped.
+        char invalid_frame[sizeof(u32_t) + 4 * sizeof(char)] = {};
+        assert(validate_fec_frame(invalid_frame, sizeof(invalid_frame)) != 0);
+
+        char frame[buf_len] = {};
+        const int frame_len = buf_len - 101;
+        frame[sizeof(u32_t)] = 0;
+        frame[sizeof(u32_t) + 1] = 2;
+        frame[sizeof(u32_t) + 2] = 0;
+        frame[sizeof(u32_t) + 3] = 0;
+        assert(validate_fec_frame(frame, frame_len) == 0);
+
+        fec_decode_manager_t bounded_decoder;
+        for (int i = 0; i < 1500; i++) {
+            write_u32(frame, (u32_t)i);
+            assert(bounded_decoder.input(frame, frame_len) == 0);
+        }
+        assert(bounded_decoder.buffered_payload_bytes() <= fec_decode_payload_limit);
+        assert(bounded_decoder.buffered_shard_count() <= fec_buff_num);
+
+        // A decoded group is only kept while its output pointers are in use.
+        // Once delivered, all of its FEC shards are released immediately.
+        char complete_frame[sizeof(u32_t) + 4 * sizeof(char) + sizeof(u32_t) + sizeof(u16_t) + 3] = {};
+        complete_frame[sizeof(u32_t)] = 0;
+        complete_frame[sizeof(u32_t) + 1] = 1;
+        complete_frame[sizeof(u32_t) + 3] = 0;
+        char *complete_payload = complete_frame + sizeof(u32_t) + 4 * sizeof(char);
+        write_u32(complete_payload, 1);
+        write_u16(complete_payload + sizeof(u32_t), 3);
+        memcpy(complete_payload + sizeof(u32_t) + sizeof(u16_t), "fec", 3);
+        fec_decode_manager_t complete_decoder;
+        assert(complete_decoder.input(complete_frame, sizeof(complete_frame)) == 0);
+        int complete_n;
+        char **complete_data;
+        int *complete_len;
+        assert(complete_decoder.output(complete_n, complete_data, complete_len) == 0);
+        assert(complete_n == 1 && complete_len[0] == 3 && memcmp(complete_data[0], "fec", 3) == 0);
+        complete_decoder.release_output_storage();
+        assert(complete_decoder.buffered_payload_bytes() == 0);
+        assert(complete_decoder.buffered_shard_count() == 0);
     }
     {
         union test_t {

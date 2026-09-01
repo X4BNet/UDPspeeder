@@ -63,6 +63,7 @@ static void process_local_datagram(conn_info_t &conn_info, char *data, int data_
     for (int i = 0; i < out_n; i++) {
         output_batch.add(out_delay[i], dest, out_arr[i], out_len[i]);
     }
+    if (conn_info.fec_encode_manager != 0) conn_info.fec_encode_manager->release_output_storage();
 }
 
 static void data_from_fec_timeout(conn_info_t &conn_info) {
@@ -76,6 +77,7 @@ static void data_from_fec_timeout(conn_info_t &conn_info) {
     dest.cook = 1;
     from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
     delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
+    if (conn_info.fec_encode_manager != 0) conn_info.fec_encode_manager->release_output_storage();
 }
 
 static void local_listen_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -157,6 +159,7 @@ static void process_remote_datagram(conn_info_t &conn_info, char *data, int data
 
         output_batch.add(out_delay[i], dest, new_data, new_len);
     }
+    if (conn_info.fec_decode_manager != 0) conn_info.fec_decode_manager->release_output_storage();
 }
 
 static void remote_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -252,6 +255,7 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
         dest.cook = 1;
         from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
         delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
+        if (conn_info.fec_encode_manager != 0) conn_info.fec_encode_manager->release_output_storage();
     }
 }
 
@@ -268,7 +272,7 @@ int tunnel_client_event_loop() {
     // int epoll_fd;
 
     conn_info_t *conn_info_p = new conn_info_t;
-    conn_info_t &conn_info = *conn_info_p;  // huge size of conn_info,do not allocate on stack
+    conn_info_t &conn_info = *conn_info_p;  // keep the watcher-owned connection lifetime explicit
 
     int &local_listen_fd = conn_info.local_listen_fd;
     new_listen_socket2(local_listen_fd, local_addr);
@@ -337,8 +341,7 @@ int tunnel_client_event_loop() {
 
     delay_manager.set_loop_and_cb(loop, delay_manager_cb);
 
-    conn_info.fec_encode_manager.set_data(&conn_info);
-    conn_info.fec_encode_manager.set_loop_and_cb(loop, fec_encode_cb);
+    conn_info.set_fec_encode_callback(fec_encode_cb);
 
     // u64_t tmp_fd64=conn_info.fec_encode_manager.get_timer_fd64();
     // ev.events = EPOLLIN;

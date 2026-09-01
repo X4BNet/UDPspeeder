@@ -249,8 +249,14 @@ struct conn_info_t : not_copy_able_t  // stores info for a raw connection.for cl
         }
     } conv_manager;
 
-    fec_encode_manager_t fec_encode_manager;
-    fec_decode_manager_t fec_decode_manager;
+    // FEC state is deliberately absent for a newly observed peer. The server
+    // first validates an entire FEC frame, then creates only the manager it
+    // needs. This keeps source-address churn from allocating megabytes.
+    fec_encode_manager_t *fec_encode_manager = 0;
+    fec_decode_manager_t *fec_decode_manager = 0;
+    void (*fec_encode_callback)(struct ev_loop *loop, struct ev_timer *watcher, int revents) = 0;
+    fec_parameter_t deferred_fec_profile;
+    int has_deferred_fec_profile = 0;
     adaptive_fec_controller_t adaptive_fec;
     ev_timer timer;
     // my_timer_t timer;
@@ -278,11 +284,29 @@ struct conn_info_t : not_copy_able_t  // stores info for a raw connection.for cl
     ~conn_info_t() {
         if (loop)
             ev_timer_stop(loop, &timer);
+        delete fec_encode_manager;
+        delete fec_decode_manager;
     }
     void update_active_time() {
         // Connection collection is second-scale; avoid a wall-clock read for
         // every datagram and keep it in step with the LRU activity clock.
         last_active_time = get_lru_current_time();
+    }
+    void set_fec_encode_callback(void (*callback)(struct ev_loop *loop, struct ev_timer *watcher, int revents)) {
+        fec_encode_callback = callback;
+    }
+    fec_encode_manager_t &ensure_fec_encode_manager() {
+        if (fec_encode_manager == 0) {
+            assert(loop != 0 && fec_encode_callback != 0);
+            fec_encode_manager = new fec_encode_manager_t;
+            fec_encode_manager->set_data(this);
+            fec_encode_manager->set_loop_and_cb(loop, fec_encode_callback);
+        }
+        return *fec_encode_manager;
+    }
+    fec_decode_manager_t &ensure_fec_decode_manager() {
+        if (fec_decode_manager == 0) fec_decode_manager = new fec_decode_manager_t;
+        return *fec_decode_manager;
     }
     /*
     conn_info_t(const conn_info_t &b)

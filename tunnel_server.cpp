@@ -76,6 +76,7 @@ void data_from_fec_timeout_or_conn_timer(conn_info_t &conn_info, tmp_mode_t mode
         if (debug_force_flush_fec || conn_info.adaptive_fec.is_enabled()) {
             from_normal_to_fec(conn_info, 0, 0, out_n, out_arr, out_len, out_delay);
             delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
+            if (conn_info.fec_encode_manager != 0) conn_info.fec_encode_manager->release_output_storage();
         }
 
         if (conn_info.stat.report_as_server(addr)) conn_info.adaptive_fec.report_statistics("server");
@@ -86,6 +87,7 @@ void data_from_fec_timeout_or_conn_timer(conn_info_t &conn_info, tmp_mode_t mode
 
     mylog(log_trace, "out_n=%d\n", out_n);
     delay_send_batch(dest, out_arr, out_len, out_delay, out_n);
+    if (conn_info.fec_encode_manager != 0) conn_info.fec_encode_manager->release_output_storage();
 }
 
 static void process_remote_datagram(conn_info_t &conn_info, fd64_t fd64, char *data, int data_len, immediate_send_batch_t &output_batch) {
@@ -124,6 +126,7 @@ static void process_remote_datagram(conn_info_t &conn_info, fd64_t fd64, char *d
     for (int i = 0; i < out_n; i++) {
         output_batch.add(out_delay[i], dest, out_arr[i], out_len[i]);
     }
+    if (conn_info.fec_encode_manager != 0) conn_info.fec_encode_manager->release_output_storage();
 }
 
 static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, char *data, int data_len, address_t addr, immediate_send_batch_t *output_batch = 0) {
@@ -147,6 +150,13 @@ static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, ch
     }
 
     if (!conn_manager.exist(addr)) {
+        // Keep an unauthenticated/unrecognised source in the tiny admission
+        // path. A connection used to allocate every FEC buffer here before
+        // the decoder could reject even a malformed inner frame.
+        if (validate_fec_frame(data, data_len) != 0) {
+            mylog(log_debug, "ignored new peer with invalid fec frame\n");
+            return;
+        }
         if (conn_manager.mp.size() >= max_conn_num) {
             mylog(log_warn, "new connection %s ignored bc max_conn_num exceed\n", addr.get_str());
             return;
@@ -179,8 +189,7 @@ static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, ch
         // u64_t timer_fd64=conn_info.timer.get_timer_fd64();
         // fd_manager.get_info(timer_fd64).ip_port=ip_port;
 
-        conn_info.fec_encode_manager.set_data(&conn_info);
-        conn_info.fec_encode_manager.set_loop_and_cb(loop, fec_encode_cb);
+        conn_info.set_fec_encode_callback(fec_encode_cb);
 
         mylog(log_info, "new connection from %s\n", addr.get_str());
     }
@@ -245,6 +254,7 @@ static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, ch
         else
             delay_send(out_delay[i], dest, new_data, new_len);
     }
+    if (conn_info.fec_decode_manager != 0) conn_info.fec_decode_manager->release_output_storage();
 }
 
 static void local_listen_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {

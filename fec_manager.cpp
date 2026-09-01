@@ -40,6 +40,10 @@ int blob_encode_t::clear() {
     current_len = (int)sizeof(u32_t);
     return 0;
 }
+void blob_encode_t::release_memory() {
+    vector<char>().swap(input_buf);
+    clear();
+}
 
 int blob_encode_t::get_num() {
     return counter;
@@ -53,22 +57,24 @@ int blob_encode_t::get_shard_len(int n, int next_packet_len) {
 }
 
 int blob_encode_t::input(char *s, int len) {
-    assert(current_len + len + sizeof(u16_t) + 100 < sizeof(input_buf));
+    assert(current_len + len + sizeof(u16_t) + 100 < (max_fec_packet_num + 5) * buf_len);
     assert(len <= 65535 && len >= 0);
+    int required = current_len + (int)sizeof(u16_t) + len;
+    if ((int)input_buf.size() < required) input_buf.resize(required);
     counter++;
     assert(counter <= max_blob_packet_num);
-    write_u16(input_buf + current_len, len);
+    write_u16(input_buf.data() + current_len, len);
     current_len += sizeof(u16_t);
-    memcpy(input_buf + current_len, s, len);
+    memcpy(input_buf.data() + current_len, s, len);
     current_len += len;
     return 0;
 }
 
 int blob_encode_t::output(int n, char **&s_arr, int &len) {
     len = round_up_div(current_len, n);
-    write_u32(input_buf, counter);
+    write_u32(input_buf.data(), counter);
     for (int i = 0; i < n; i++) {
-        output_buf[i] = input_buf + len * i;
+        output_buf[i] = input_buf.data() + len * i;
     }
     s_arr = output_buf;
     return 0;
@@ -82,6 +88,12 @@ int blob_decode_t::clear() {
     counter = 0;
     return 0;
 }
+void blob_decode_t::release_memory() {
+    vector<char>().swap(input_buf);
+    vector<char *>().swap(output_buf);
+    vector<int>().swap(output_len);
+    clear();
+}
 int blob_decode_t::input(char *s, int len) {
     if (last_len != -1) {
         assert(last_len == len);
@@ -89,8 +101,10 @@ int blob_decode_t::input(char *s, int len) {
     counter++;
     assert(counter <= max_fec_packet_num);
     last_len = len;
-    assert(current_len + len + 100 < (int)sizeof(input_buf));  // avoid overflow
-    memcpy(input_buf + current_len, s, len);
+    assert(current_len + len + 100 < (max_fec_packet_num + 5) * buf_len);  // avoid overflow
+    int required = current_len + len;
+    if ((int)input_buf.size() < required) input_buf.resize(required);
+    memcpy(input_buf.data() + current_len, s, len);
     current_len += len;
     return 0;
 }
@@ -102,13 +116,15 @@ int blob_decode_t::output(int &n, char **&s_arr, int *&len_arr) {
         return -1;
     }
 
-    n = (int)read_u32(input_buf + parser_pos);
+    n = (int)read_u32(input_buf.data() + parser_pos);
     if (n > max_blob_packet_num) {
         mylog(log_info, "failed 1\n");
         return -1;
     }
-    s_arr = output_buf;
-    len_arr = output_len;
+    output_buf.resize(n);
+    output_len.resize(n);
+    s_arr = output_buf.data();
+    len_arr = output_len.data();
 
     parser_pos += sizeof(u32_t);
     for (int i = 0; i < n; i++) {
@@ -116,13 +132,13 @@ int blob_decode_t::output(int &n, char **&s_arr, int *&len_arr) {
             mylog(log_info, "failed2 \n");
             return -1;
         }
-        len_arr[i] = (int)read_u16(input_buf + parser_pos);
+        len_arr[i] = (int)read_u16(input_buf.data() + parser_pos);
         parser_pos += (int)sizeof(u16_t);
         if (parser_pos + len_arr[i] > current_len) {
             mylog(log_info, "failed 3 %d  %d %d\n", parser_pos, len_arr[i], current_len);
             return -1;
         }
-        s_arr[i] = input_buf + parser_pos;
+        s_arr[i] = input_buf.data() + parser_pos;
         parser_pos += len_arr[i];
     }
     return 0;
@@ -154,6 +170,12 @@ fec_encode_manager_t::fec_encode_manager_t() {
     fec_par.clone(g_fec_par);
     has_pending_fec_update = 0;
     clear_data();
+}
+char *fec_encode_manager_t::input_slot(int index) {
+    assert(index >= 0 && index < max_fec_packet_num + 5);
+    size_t required = size_t(index + 1) * buf_len;
+    if (input_buf.size() < required) input_buf.resize(required);
+    return input_buf.data() + size_t(index) * buf_len;
 }
 /*
 int fec_encode_manager_t::reset_fec_parameter(int data_num,int redundant_num,int mtu,int queue_len,int timeout,int mode)
@@ -190,7 +212,7 @@ int fec_encode_manager_t::append(char *s, int len /*,int &is_first_packet*/) {
         mylog(log_trace, "counter=%d\n", counter);
         assert(len <= 65535 && len >= 0);
         // assert(len<=fec_mtu);//relax this limitation
-        char *p = input_buf[counter] + sizeof(u32_t) + 4 * sizeof(char);  // copy directly to final position,avoid unnecessary copy.
+        char *p = input_slot(counter) + sizeof(u32_t) + 4 * sizeof(char);  // copy directly to final position,avoid unnecessary copy.
         // remember to change this,if protocol is modified
 
         write_u16(p, (u16_t)((u32_t)len));  // TODO  omit this u16 for data packet while sending
@@ -319,13 +341,17 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
 
         // mylog(log_trace,"%d %d %d\n",actual_data_num,actual_redundant_num,fec_len);
 
+        // Allocate only the slots needed by this completed group. This keeps
+        // an idle encoder small while making all pointers below stable.
+        input_slot(actual_data_num + actual_redundant_num - 1);
         char *tmp_output_buf[max_fec_packet_num + 5] = {0};
         for (int i = 0; i < actual_data_num + actual_redundant_num; i++) {
+            char *slot = input_slot(i);
             int tmp_idx = 0;
 
-            write_u32(input_buf[i] + tmp_idx, seq);
+            write_u32(slot + tmp_idx, seq);
             tmp_idx += sizeof(u32_t);
-            input_buf[i][tmp_idx++] = (unsigned char)fec_par.mode;
+            slot[tmp_idx++] = (unsigned char)fec_par.mode;
             if (fec_par.mode == 1 && i < actual_data_num) {
                 // A k=1 mode-1 group can be recovered from any one shard.
                 // Advertise its actual shape on the systematic frame so a
@@ -333,24 +359,24 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
                 // group. Older decoders already accept this normal k=1 FEC
                 // header, so this stays wire compatible.
                 if (actual_data_num == 1) {
-                    input_buf[i][tmp_idx++] = (unsigned char)actual_data_num;
-                    input_buf[i][tmp_idx++] = (unsigned char)actual_redundant_num;
+                    slot[tmp_idx++] = (unsigned char)actual_data_num;
+                    slot[tmp_idx++] = (unsigned char)actual_redundant_num;
                 } else {
-                    input_buf[i][tmp_idx++] = (unsigned char)0;
-                    input_buf[i][tmp_idx++] = (unsigned char)0;
+                    slot[tmp_idx++] = (unsigned char)0;
+                    slot[tmp_idx++] = (unsigned char)0;
                 }
             } else {
-                input_buf[i][tmp_idx++] = (unsigned char)actual_data_num;
-                input_buf[i][tmp_idx++] = (unsigned char)actual_redundant_num;
+                slot[tmp_idx++] = (unsigned char)actual_data_num;
+                slot[tmp_idx++] = (unsigned char)actual_redundant_num;
             }
-            input_buf[i][tmp_idx++] = (unsigned char)i;
+            slot[tmp_idx++] = (unsigned char)i;
 
-            tmp_output_buf[i] = input_buf[i] + tmp_idx;  //////caution ,trick here.
+            tmp_output_buf[i] = slot + tmp_idx;  //////caution ,trick here.
 
             if (fec_par.mode == 0) {
                 output_len[i] = tmp_idx + fec_len;
                 if (i < actual_data_num) {
-                    memcpy(input_buf[i] + tmp_idx, blob_output[i], fec_len);
+                    memcpy(slot + tmp_idx, blob_output[i], fec_len);
                 }
             } else {
                 if (i < actual_data_num) {
@@ -359,16 +385,17 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
                 } else
                     output_len[i] = tmp_idx + fec_len;
             }
-            output_buf[i] = input_buf[i];  // output_buf points to same block of memory with different offset
+            output_buf[i] = slot;  // output_buf points to same block of memory with different offset
         }
 
         if (0) {
             printf("seq=%u,fec_len=%d,%d %d,before fec\n", seq, fec_len, actual_data_num, actual_redundant_num);
 
             for (int i = 0; i < actual_data_num; i++) {
+                char *debug_slot = input_slot(i);
                 printf("{");
                 for (int j = 0; j < 8 + fec_len; j++) {
-                    log_bare(log_warn, "0x%02x,", (u32_t)(unsigned char)input_buf[i][j]);
+                    log_bare(log_warn, "0x%02x,", (u32_t)(unsigned char)debug_slot[j]);
                 }
                 printf("},\n");
                 // log_bare(log_warn,"")
@@ -440,16 +467,17 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
             output_n = 1;
 
             int tmp_idx = 0;
-            write_u32(input_buf[input_buf_idx] + tmp_idx, seq);
+            char *slot = input_slot(input_buf_idx);
+            write_u32(slot + tmp_idx, seq);
             tmp_idx += sizeof(u32_t);
 
-            input_buf[input_buf_idx][tmp_idx++] = (unsigned char)fec_par.mode;
-            input_buf[input_buf_idx][tmp_idx++] = (unsigned char)0;
-            input_buf[input_buf_idx][tmp_idx++] = (unsigned char)0;
-            input_buf[input_buf_idx][tmp_idx++] = (unsigned char)((u32_t)input_buf_idx);
+            slot[tmp_idx++] = (unsigned char)fec_par.mode;
+            slot[tmp_idx++] = (unsigned char)0;
+            slot[tmp_idx++] = (unsigned char)0;
+            slot[tmp_idx++] = (unsigned char)((u32_t)input_buf_idx);
 
             output_len[0] = input_len[input_buf_idx] + tmp_idx;
-            output_buf[0] = input_buf[input_buf_idx];
+            output_buf[0] = slot;
 
             if (0) {
                 printf("seq=%u,buf_idx=%d\n", seq, input_buf_idx);
@@ -489,375 +517,286 @@ int fec_decode_manager_t::re_init()
         return 0;
 }*/
 
+int validate_fec_frame(const char *s, int len) {
+    const int header_len = sizeof(u32_t) + 4 * sizeof(char);
+    if (s == 0 || len < header_len) return -1;
+
+    int type = (unsigned char)s[sizeof(u32_t)];
+    int data_num = (unsigned char)s[sizeof(u32_t) + 1];
+    int redundant_num = (unsigned char)s[sizeof(u32_t) + 2];
+    int inner_index = (unsigned char)s[sizeof(u32_t) + 3];
+    int payload_len = len - header_len;
+    if (type != 0 && type != 1) return -1;
+    if (type == 0 && data_num == 0) return -1;
+    if (data_num + redundant_num >= max_fec_packet_num) return -1;
+
+    if (type == 0) return inner_index < data_num + redundant_num ? 0 : -1;
+
+    if (payload_len < (int)sizeof(u16_t)) return -1;
+    if (data_num == 0) {
+        return redundant_num == 0 && (int)(read_u16((char *)s + header_len) + sizeof(u16_t)) == payload_len ? 0 : -1;
+    }
+    return inner_index < data_num + redundant_num ? 0 : -1;
+}
+
+void fec_decode_manager_t::erase_group(unordered_map<u32_t, fec_group_t>::iterator it, int account_loss) {
+    u32_t seq = it->first;
+    fec_group_t &group = it->second;
+    int count = (int)group.group_mp.size();
+    if (account_loss && group.data_num > 0 && count < group.data_num) {
+        statistics.unrecoverable_packets += group.data_num;
+        if (debug_fec_dec)
+            mylog(log_debug, "[dec][failed]seq=%08x x=%d y=%d cnt=%d\n", seq, group.data_num, group.redundant_num, count);
+        else
+            mylog(log_trace, "[dec][failed]seq=%08x x=%d y=%d cnt=%d\n", seq, group.data_num, group.redundant_num, count);
+    }
+    for (auto shard = group.group_mp.begin(); shard != group.group_mp.end(); ++shard) {
+        retained_payload_bytes -= shard->second.buf.size();
+    }
+    retained_shard_count -= group.group_mp.size();
+    anti_replay.set_invalid(seq);
+    mp.erase(it);
+}
+
+int fec_decode_manager_t::make_room(size_t bytes, u32_t protected_seq) {
+    if (bytes > fec_decode_payload_limit) return -1;
+    while (retained_shard_count >= fec_buff_num || retained_payload_bytes + bytes > fec_decode_payload_limit) {
+        auto victim = mp.end();
+        for (auto it = mp.begin(); it != mp.end(); ++it) {
+            if (it->first == protected_seq) continue;
+            if (victim == mp.end() || it->second.first_seen_time < victim->second.first_seen_time) victim = it;
+        }
+        if (victim == mp.end()) return -1;
+        erase_group(victim, 1);
+    }
+    return 0;
+}
+
+void fec_decode_manager_t::release_output_storage() {
+    if (ready_for_output) return;
+    if (has_completed_group) {
+        auto it = mp.find(completed_group_seq);
+        if (it != mp.end()) erase_group(it, 0);
+        has_completed_group = 0;
+    }
+    if (mp.empty()) blob_decode.release_memory();
+}
+
 int fec_decode_manager_t::input(char *s, int len) {
     assert(s != 0);
     assert(len + 100 < buf_len);  // guaranteed by upper level
-
-    int tmp_idx = 0;
-    int tmp_header_len = sizeof(u32_t) + sizeof(char) * 4;
-    if (len < tmp_header_len) {
-        mylog(log_warn, "len =%d\n", len);
-        return -1;
-    }
-    u32_t seq = read_u32(s + tmp_idx);
-    tmp_idx += sizeof(u32_t);
-    int type = (unsigned char)s[tmp_idx++];
-    int data_num = (unsigned char)s[tmp_idx++];
-    int redundant_num = (unsigned char)s[tmp_idx++];
-    int inner_index = (unsigned char)s[tmp_idx++];
-    len = len - tmp_idx;
-
-    // mylog(log_trace,"input\n");
-
-    if (len < 0) {
-        mylog(log_warn, "len<0\n");
+    release_output_storage();
+    if (validate_fec_frame(s, len) != 0) {
+        mylog(log_warn, "invalid fec frame\n");
         return -1;
     }
 
-    if (type == 1) {
-        if (len < (int)sizeof(u16_t)) {
-            mylog(log_warn, "type==1&&len<2\n");
-            return -1;
-        }
-        if (data_num == 0 && (int)(read_u16(s + tmp_idx) + sizeof(u16_t)) != len) {
-            mylog(log_warn, "inner_index<data_num&&read_u16(s+tmp_idx)+sizeof(u16_t)!=len    %d %d\n", (int)(read_u16(s + tmp_idx) + sizeof(u16_t)), len);
-            return -1;
-        }
-    }
+    const int header_len = sizeof(u32_t) + 4 * sizeof(char);
+    u32_t seq = read_u32(s);
+    int type = (unsigned char)s[sizeof(u32_t)];
+    int data_num = (unsigned char)s[sizeof(u32_t) + 1];
+    int redundant_num = (unsigned char)s[sizeof(u32_t) + 2];
+    int inner_index = (unsigned char)s[sizeof(u32_t) + 3];
+    int payload_len = len - header_len;
 
-    if (type == 0 && data_num == 0) {
-        mylog(log_warn, "unexpected type==0&&data_num==0\n");
-        return -1;
-    }
-    if (data_num + redundant_num >= max_fec_packet_num) {
-        mylog(log_warn, "data_num+redundant_num>=max_fec_packet_num\n");
-        return -1;
-    }
     if (!anti_replay.is_valid(seq)) {
         mylog(log_trace, "!anti_replay.is_valid(seq) ,seq =%u\n", seq);
         return 0;
     }
 
-    // k=1 mode-1 frames are replication, not a generic RS group. A new
-    // encoder writes the full k=1 header on its systematic frame; every
-    // parity frame already has the same header. The payload is safe to pass
-    // directly because callers synchronously consume output before reusing
-    // their receive buffer. Marking the sequence invalid suppresses the
-    // remaining replicas, while a lost systematic frame is recovered by the
-    // first received parity frame. Older emitters use data_num==0 here and
-    // continue through the retained-copy generic path below.
-    if (type == 1 && data_num == 1 && inner_index < data_num + redundant_num &&
-        (inner_index == 0 || mp.find(seq) == mp.end())) {
-        int direct_len = (int)read_u16(s + tmp_idx);
-        if (direct_len != len - (int)sizeof(u16_t) || direct_len > max_data_len) {
-            mylog(log_warn, "invalid k=1 replicated frame len=%d payload_len=%d\n", len, direct_len);
+    // k=1 mode-1 frames are replication. They need no retained FEC state.
+    if (type == 1 && data_num == 1 && (inner_index == 0 || mp.find(seq) == mp.end())) {
+        int direct_len = (int)read_u16(s + header_len);
+        if (direct_len != payload_len - (int)sizeof(u16_t) || direct_len > max_data_len) {
+            mylog(log_warn, "invalid k=1 replicated frame len=%d payload_len=%d\n", payload_len, direct_len);
             return -1;
         }
         assert(ready_for_output == 0);
         output_n = 1;
-        output_s_arr_buf[0] = s + tmp_idx + sizeof(u16_t);
+        output_s_arr_buf[0] = s + header_len + sizeof(u16_t);
         output_len_arr_buf[0] = direct_len;
         output_s_arr = output_s_arr_buf;
         output_len_arr = output_len_arr_buf;
         ready_for_output = 1;
         statistics.delivered_packets++;
-        // A k=1 group is sent as replicas and delivered on the first frame.
-        // Seeing a parity replica first does not prove the systematic frame
-        // was lost: it may simply be delayed or reordered. Treating every
-        // parity-first arrival as recovered makes adaptive FEC see severe
-        // phantom loss on a healthy, reordered link. Delivery still occurs
-        // immediately; only the loss-feedback classification changes.
         anti_replay.set_invalid(seq);
         return 0;
     }
 
-    fec_group_t &group = mp[seq];
-    if (group.first_seen_time == 0) group.first_seen_time = get_current_time_us();
-
-    if (group.fec_done != 0) {
-        mylog(log_debug, "fec already done, ignore, seq=%u\n", seq);
-        return -1;
+    auto group_it = mp.find(seq);
+    if (group_it == mp.end()) {
+        group_it = mp.emplace(seq, fec_group_t()).first;
+        group_it->second.first_seen_time = get_current_time_us();
     }
-
+    fec_group_t &group = group_it->second;
     if (group.group_mp.find(inner_index) != group.group_mp.end()) {
-        mylog(log_debug, "dup fec index\n");  // duplicate can happen on  a normal network, so its just log_debug
+        mylog(log_debug, "dup fec index\n");
         return -1;
     }
-
     if (group.type == -1)
         group.type = type;
-    else {
-        if (group.type != type) {
-            mylog(log_warn, "type mismatch\n");
-            return -1;
-        }
+    else if (group.type != type) {
+        mylog(log_warn, "type mismatch\n");
+        return -1;
     }
-
     if (data_num != 0) {
-        // mp[seq].data_counter++;
-
         if (group.data_num == -1) {
             group.data_num = data_num;
             group.redundant_num = redundant_num;
-            group.len = len;
-        } else {
-            if (group.data_num != data_num || group.redundant_num != redundant_num || group.len != len) {
-                mylog(log_warn, "unexpected mp[seq].data_num!=data_num||mp[seq].redundant_num!=redundant_num||mp[seq].len!=len\n");
-                return -1;
-            }
-        }
-    }
-
-    // mylog(log_info,"mp.size()=%d index=%d\n",mp.size(),index);
-
-    if (fec_data[index].used != 0) {
-        u32_t tmp_seq = fec_data[index].seq;
-        anti_replay.set_invalid(tmp_seq);
-
-        auto tmp_it = mp.find(tmp_seq);
-        if (tmp_it != mp.end()) {
-            int x = tmp_it->second.data_num;
-            int y = tmp_it->second.redundant_num;
-            int cnt = tmp_it->second.group_mp.size();
-
-            if (cnt < x) {
-                statistics.unrecoverable_packets += x;
-                if (debug_fec_dec)
-                    mylog(log_debug, "[dec][failed]seq=%08x x=%d y=%d cnt=%d\n", tmp_seq, x, y, cnt);
-                else
-                    mylog(log_trace, "[dec][failed]seq=%08x x=%d y=%d cnt=%d\n", tmp_seq, x, y, cnt);
-            }
-            mp.erase(tmp_it);
-        }
-        if (tmp_seq == seq) {
-            mylog(log_warn, "unexpected tmp_seq==seq ,seq=%d\n", seq);
+            group.len = payload_len;
+        } else if (group.data_num != data_num || group.redundant_num != redundant_num || group.len != payload_len) {
+            mylog(log_warn, "inconsistent fec group header\n");
             return -1;
         }
     }
 
-    fec_data[index].used = 1;
-    fec_data[index].seq = seq;
-    fec_data[index].type = type;
-    fec_data[index].data_num = data_num;
-    fec_data[index].redundant_num = redundant_num;
-    fec_data[index].idx = inner_index;
-    fec_data[index].len = len;
-    assert(0 <= index && index < (int)fec_buff_num);
-    assert(len + 100 < buf_len);
-    memcpy(fec_data[index].buf, s + tmp_idx, len);
+    if (make_room(payload_len, seq) != 0) {
+        mylog(log_warn, "fec decode memory limit reached, dropping seq=%u\n", seq);
+        group_it = mp.find(seq);
+        if (group_it != mp.end()) erase_group(group_it, 1);
+        return -1;
+    }
+    fec_data_t shard;
+    shard.len = payload_len;
+    shard.buf.assign(s + header_len, s + header_len + payload_len);
+    retained_payload_bytes += shard.buf.size();
+    retained_shard_count++;
+    group.group_mp.emplace(inner_index, std::move(shard));
     if (group.highest_inner_index >= 0 && inner_index < group.highest_inner_index) statistics.reordered_packets++;
     if (inner_index > group.highest_inner_index) group.highest_inner_index = inner_index;
-    group.group_mp[inner_index] = index;
-    // index++ at end of function
-
-    map<int, int> &inner_mp = mp[seq].group_mp;
 
     int about_to_fec = 0;
     if (type == 0) {
-        // assert((int)inner_mp.size()<=data_num);
-        if ((int)inner_mp.size() > data_num) {
+        if ((int)group.group_mp.size() > data_num) {
             mylog(log_warn, "inner_mp.size()>data_num\n");
-            anti_replay.set_invalid(seq);
-            goto end;
+            erase_group(mp.find(seq), 1);
+            return -1;
         }
-        if ((int)inner_mp.size() == data_num)
-            about_to_fec = 1;
-    } else {
-        if (mp[seq].data_num != -1) {
-            if ((int)inner_mp.size() > mp[seq].data_num + 1) {
-                mylog(log_warn, "inner_mp.size()>data_num+1\n");
-                anti_replay.set_invalid(seq);
-                goto end;
-            }
-            if ((int)inner_mp.size() >= mp[seq].data_num) {
-                about_to_fec = 1;
-            }
+        about_to_fec = (int)group.group_mp.size() == data_num;
+    } else if (group.data_num != -1) {
+        if ((int)group.group_mp.size() > group.data_num + 1) {
+            mylog(log_warn, "inner_mp.size()>data_num+1\n");
+            erase_group(mp.find(seq), 1);
+            return -1;
         }
+        about_to_fec = (int)group.group_mp.size() >= group.data_num;
     }
 
-    if (about_to_fec) {
-        int group_data_num = mp[seq].data_num;
-        int group_redundant_num = mp[seq].redundant_num;
-
-        int x_got = 0;
-        int y_got = 0;
-        // mylog(log_error,"fec here!\n");
-        if (type == 0) {
-            char *fec_tmp_arr[max_fec_packet_num + 5] = {0};
-            for (auto it = inner_mp.begin(); it != inner_mp.end(); it++) {
-                if (it->first < group_data_num)
-                    x_got++;
-                else
-                    y_got++;
-                fec_tmp_arr[it->first] = fec_data[it->second].buf;
-            }
-            if (group_data_num == 1) {
-                // Any k=1 shard is the original blob.  Point at the retained
-                // receive buffer rather than constructing an RS decoder.
-                fec_tmp_arr[0] = fec_data[inner_mp.begin()->second].buf;
-            } else {
-                assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, fec_tmp_arr, len) == 0);  // the input data has been modified in-place
-            }
-            // this line should always succeed
-            mp[seq].fec_done = 1;
-
-            if (debug_fec_dec)
-                mylog(log_debug, "[dec]seq=%08x x=%d y=%d len=%d cnt=%d X=%d Y=%d\n", seq, group_data_num, group_redundant_num, len, int(inner_mp.size()), x_got, y_got);
-            else
-                mylog(log_trace, "[dec]seq=%08x x=%d y=%d len=%d cnt=%d X=%d Y=%d\n", seq, group_data_num, group_redundant_num, len, int(inner_mp.size()), x_got, y_got);
-
-            blob_decode.clear();
-            for (int i = 0; i < group_data_num; i++) {
-                blob_decode.input(fec_tmp_arr[i], len);
-            }
-            if (blob_decode.output(output_n, output_s_arr, output_len_arr) != 0) {
-                mylog(log_warn, "blob_decode failed\n");
-                // ready_for_output=0;
-                anti_replay.set_invalid(seq);
-                goto end;
-            }
-            statistics.delivered_packets += output_n;
-            if (group_data_num > x_got) statistics.recovered_packets += group_data_num - x_got;
+    if (!about_to_fec) {
+        if (decode_fast_send && type == 1 && data_num == 0) {
+            fec_data_t &current = group.group_mp.find(inner_index)->second;
             assert(ready_for_output == 0);
+            output_n = 1;
+            output_s_arr_buf[0] = current.buf.data() + sizeof(u16_t);
+            output_len_arr_buf[0] = current.len - sizeof(u16_t);
+            output_s_arr = output_s_arr_buf;
+            output_len_arr = output_len_arr_buf;
             ready_for_output = 1;
-            anti_replay.set_invalid(seq);
-        } else  // type==1
-        {
-            int max_len = -1;
-            int fec_result_ok = 1;
-            int data_check_ok = 1;
-            int debug_num = inner_mp.size();
-
-            int missed_packet[max_fec_packet_num + 5];
-            int missed_packet_counter = 0;
-
-            // outupt_s_arr_buf[max_fec_packet_num+5]={0};
-
-            // memset(output_s_arr_buf,0,sizeof(output_s_arr_buf));//in efficient
-
-            for (int i = 0; i < group_data_num + group_redundant_num; i++) {
-                output_s_arr_buf[i] = 0;
-            }
-            for (auto it = inner_mp.begin(); it != inner_mp.end(); it++) {
-                if (it->first < group_data_num)
-                    x_got++;
-                else
-                    y_got++;
-
-                output_s_arr_buf[it->first] = fec_data[it->second].buf;
-                if (fec_data[it->second].len < (int)sizeof(u16_t)) {
-                    mylog(log_warn, "fec_data[it->second].len<(int)sizeof(u16_t)");
-                    data_check_ok = 0;
-                }
-
-                if (fec_data[it->second].len > max_len)
-                    max_len = fec_data[it->second].len;
-            }
-            if (max_len != mp[seq].len) {
-                data_check_ok = 0;
-                mylog(log_warn, "max_len!=mp[seq].len");
-            }
-            if (data_check_ok == 0) {
-                // ready_for_output=0;
-                mylog(log_warn, "data_check_ok==0\n");
-                anti_replay.set_invalid(seq);
-                goto end;
-            }
-            for (auto it = inner_mp.begin(); it != inner_mp.end(); it++) {
-                int tmp_idx = it->second;
-                assert(max_len >= fec_data[tmp_idx].len);  // guaranteed by data_check_ok
-                memset(fec_data[tmp_idx].buf + fec_data[tmp_idx].len, 0, max_len - fec_data[tmp_idx].len);
-            }
-
-            for (int i = 0; i < group_data_num; i++) {
-                if (output_s_arr_buf[i] == 0 || i == inner_index)  // only missed packet +current packet
-                {
-                    missed_packet[missed_packet_counter++] = i;
-                }
-            }
-            mylog(log_trace, "fec done,%d %d,missed_packet_counter=%d\n", group_data_num, group_redundant_num, missed_packet_counter);
-
-            if (group_data_num == 1) {
-                // The mode-1 wrapper is replicated too; reuse the retained
-                // shard rather than running the generic RS decoder.
-                output_s_arr_buf[0] = fec_data[inner_mp.begin()->second].buf;
-            } else {
-                assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, output_s_arr_buf, max_len) == 0);  // this should always succeed
-            }
-            mp[seq].fec_done = 1;
-
-            int sum_ori = 0;
-
-            for (int i = 0; i < group_data_num; i++) {
-                output_len_arr_buf[i] = read_u16(output_s_arr_buf[i]);
-                sum_ori += output_len_arr_buf[i];
-                output_s_arr_buf[i] += sizeof(u16_t);
-                if (output_len_arr_buf[i] > max_data_len) {
-                    mylog(log_warn, "invalid len %d,seq= %u,data_num= %d r_num= %d,i= %d\n", output_len_arr_buf[i], seq, group_data_num, group_redundant_num, i);
-                    fec_result_ok = 0;
-                    for (int i = 0; i < missed_packet_counter; i++) {
-                        log_bare(log_warn, "%d ", missed_packet[i]);
-                    }
-                    log_bare(log_warn, "\n");
-                    // break;
-                }
-            }
-
-            int sum = max_len * group_data_num;
-
-            if (debug_fec_dec)
-                mylog(log_debug, "[dec]seq=%08x x=%d y=%d len=%d sum_ori=%d sum=%d X=%d Y=%d\n", seq, group_data_num, group_redundant_num, max_len, sum_ori, sum, x_got, y_got);
-            else
-                mylog(log_trace, "[dec]seq=%08x x=%d y=%d len=%d sum_ori=%d sum=%d X=%d Y=%d\n", seq, group_data_num, group_redundant_num, max_len, sum_ori, sum, x_got, y_got);
-
-            if (fec_result_ok) {
-                statistics.delivered_packets += group_data_num;
-                if (group_data_num > x_got) statistics.recovered_packets += group_data_num - x_got;
-                output_n = group_data_num;
-
-                if (decode_fast_send) {
-                    output_n = missed_packet_counter;
-                    for (int i = 0; i < missed_packet_counter; i++) {
-                        output_s_arr_buf[i] = output_s_arr_buf[missed_packet[i]];
-                        output_len_arr_buf[i] = output_len_arr_buf[missed_packet[i]];
-                    }
-                }
-
-                output_s_arr = output_s_arr_buf;
-                output_len_arr = output_len_arr_buf;
-                assert(ready_for_output == 0);
-                ready_for_output = 1;
-            } else {
-                // fec_not_ok:
-                ready_for_output = 0;
-            }
-            anti_replay.set_invalid(seq);
-        }   // end of type==1
-    } else  // not about_to_fec
-    {
-        if (decode_fast_send) {
-            if (type == 1 && data_num == 0) {
-                assert(ready_for_output == 0);
-                output_n = 1;
-                int check_len = read_u16(fec_data[index].buf);
-                output_s_arr_buf[0] = fec_data[index].buf + sizeof(u16_t);
-                output_len_arr_buf[0] = fec_data[index].len - sizeof(u16_t);
-
-                if (output_len_arr_buf[0] != check_len) {
-                    mylog(log_warn, "len mismatch %d %d\n", output_len_arr_buf[0], check_len);
-                }
-                output_s_arr = output_s_arr_buf;
-                output_len_arr = output_len_arr_buf;
-
-                ready_for_output = 1;
-            }
         }
+        return 0;
     }
 
-end:
-    index++;
-    if (index == int(fec_buff_num)) index = 0;
+    int group_data_num = group.data_num;
+    int group_redundant_num = group.redundant_num;
+    int x_got = 0;
+    int y_got = 0;
+    if (type == 0) {
+        char *fec_tmp_arr[max_fec_packet_num + 5] = {0};
+        for (auto it = group.group_mp.begin(); it != group.group_mp.end(); ++it) {
+            if (it->first < group_data_num)
+                x_got++;
+            else
+                y_got++;
+            fec_tmp_arr[it->first] = it->second.buf.data();
+        }
+        if (group_data_num == 1)
+            fec_tmp_arr[0] = group.group_mp.begin()->second.buf.data();
+        else
+            assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, fec_tmp_arr, payload_len) == 0);
 
+        blob_decode.clear();
+        for (int i = 0; i < group_data_num; i++) blob_decode.input(fec_tmp_arr[i], payload_len);
+        if (blob_decode.output(output_n, output_s_arr, output_len_arr) != 0) {
+            mylog(log_warn, "blob_decode failed\n");
+            erase_group(mp.find(seq), 1);
+            return -1;
+        }
+        statistics.delivered_packets += output_n;
+        if (group_data_num > x_got) statistics.recovered_packets += group_data_num - x_got;
+        ready_for_output = 1;
+    } else {
+        int max_len = -1;
+        int data_check_ok = 1;
+        int missed_packet[max_fec_packet_num + 5];
+        int missed_packet_counter = 0;
+        for (int i = 0; i < group_data_num + group_redundant_num; i++) output_s_arr_buf[i] = 0;
+        for (auto it = group.group_mp.begin(); it != group.group_mp.end(); ++it) {
+            if (it->first < group_data_num)
+                x_got++;
+            else
+                y_got++;
+            output_s_arr_buf[it->first] = it->second.buf.data();
+            if (it->second.len < (int)sizeof(u16_t)) data_check_ok = 0;
+            if (it->second.len > max_len) max_len = it->second.len;
+        }
+        if (max_len != group.len) data_check_ok = 0;
+        if (!data_check_ok) {
+            mylog(log_warn, "invalid mode-1 fec group\n");
+            erase_group(mp.find(seq), 1);
+            return -1;
+        }
+        size_t padding = 0;
+        for (auto it = group.group_mp.begin(); it != group.group_mp.end(); ++it) {
+            if (max_len > it->second.len) padding += max_len - it->second.len;
+        }
+        if (padding != 0 && make_room(padding, seq) != 0) {
+            mylog(log_warn, "fec decode memory limit reached while normalizing mode-1 shards\n");
+            erase_group(mp.find(seq), 1);
+            return -1;
+        }
+        for (auto it = group.group_mp.begin(); it != group.group_mp.end(); ++it) {
+            assert(max_len >= it->second.len);
+            it->second.buf.resize(max_len, 0);
+            output_s_arr_buf[it->first] = it->second.buf.data();
+        }
+        retained_payload_bytes += padding;
+        for (int i = 0; i < group_data_num; i++) {
+            if (output_s_arr_buf[i] == 0 || i == inner_index) missed_packet[missed_packet_counter++] = i;
+        }
+        if (group_data_num == 1)
+            output_s_arr_buf[0] = group.group_mp.begin()->second.buf.data();
+        else
+            assert(rs_decode2(group_data_num, group_data_num + group_redundant_num, output_s_arr_buf, max_len) == 0);
+
+        int fec_result_ok = 1;
+        for (int i = 0; i < group_data_num; i++) {
+            output_len_arr_buf[i] = read_u16(output_s_arr_buf[i]);
+            output_s_arr_buf[i] += sizeof(u16_t);
+            if (output_len_arr_buf[i] > max_data_len) fec_result_ok = 0;
+        }
+        if (!fec_result_ok) {
+            mylog(log_warn, "invalid recovered mode-1 packet\n");
+            erase_group(mp.find(seq), 1);
+            return -1;
+        }
+        statistics.delivered_packets += group_data_num;
+        if (group_data_num > x_got) statistics.recovered_packets += group_data_num - x_got;
+        output_n = group_data_num;
+        if (decode_fast_send) {
+            output_n = missed_packet_counter;
+            for (int i = 0; i < missed_packet_counter; i++) {
+                output_s_arr_buf[i] = output_s_arr_buf[missed_packet[i]];
+                output_len_arr_buf[i] = output_len_arr_buf[missed_packet[i]];
+            }
+        }
+        output_s_arr = output_s_arr_buf;
+        output_len_arr = output_len_arr_buf;
+        ready_for_output = 1;
+    }
+
+    anti_replay.set_invalid(seq);
+    completed_group_seq = seq;
+    has_completed_group = 1;
     return 0;
 }
 int fec_decode_manager_t::output(int &n, char **&s_arr, int *&len_arr) {
@@ -876,14 +815,12 @@ int fec_decode_manager_t::output(int &n, char **&s_arr, int *&len_arr) {
 
 int fec_decode_manager_t::expire_incomplete_groups(my_time_t maximum_age_us) {
     if (maximum_age_us == 0) return 0;
-
     my_time_t now = get_current_time_us();
     for (auto it = mp.begin(); it != mp.end();) {
         fec_group_t &group = it->second;
         if (group.data_num > 0 && group.first_seen_time != 0 && now - group.first_seen_time >= maximum_age_us && (int)group.group_mp.size() < group.data_num) {
-            statistics.unrecoverable_packets += group.data_num;
-            anti_replay.set_invalid(it->first);
-            it = mp.erase(it);
+            auto erase_it = it++;
+            erase_group(erase_it, 1);
         } else {
             ++it;
         }

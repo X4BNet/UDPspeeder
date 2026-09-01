@@ -14,6 +14,10 @@
 
 const int max_blob_packet_num = 30000;      // how many packet can be contain in a blob_t ,can be set very large
 const u32_t anti_replay_buff_size = 30000;  // can be set very large
+// Decoder payload is retained only while a FEC group is incomplete. Keep the
+// bound below a single-digit MiB even when --decode-buf is set excessively.
+const size_t fec_decode_payload_limit = 4 * 1024 * 1024;
+const int fec_incomplete_group_timeout_us = 1000 * 1000;
 
 const int max_fec_packet_num = 255;  // this is the limitation of the rs lib
 extern u32_t fec_buff_num;
@@ -197,16 +201,15 @@ struct anti_replay_t {
         int index;
     };
 
-    u64_t replay_buffer[anti_replay_buff_size];
+    vector<u32_t> replay_buffer;
     unordered_map<u32_t, info_t> mp;
-    int index;
+    size_t index;
     anti_replay_t() {
         clear();
     }
     int clear() {
-        memset(replay_buffer, -1, sizeof(replay_buffer));
-        mp.clear();
-        mp.rehash(anti_replay_buff_size * 3);
+        vector<u32_t>().swap(replay_buffer);
+        unordered_map<u32_t, info_t>().swap(mp);
         index = 0;
         return 0;
     }
@@ -217,22 +220,28 @@ struct anti_replay_t {
             // mp[seq].my_time=get_current_time_rough();
             return;
         }
-        if (replay_buffer[index] != u64_t(i64_t(-1))) {
-            assert(mp.find(replay_buffer[index]) != mp.end());
-            mp.erase(replay_buffer[index]);
+        if (replay_buffer.size() == anti_replay_buff_size) {
+            if (replay_buffer[index] != u32_t(-1)) {
+                assert(mp.find(replay_buffer[index]) != mp.end());
+                mp.erase(replay_buffer[index]);
+            }
+            replay_buffer[index] = seq;
+        } else {
+            replay_buffer.push_back(seq);
+            index = replay_buffer.size() - 1;
         }
-        replay_buffer[index] = seq;
         assert(mp.find(seq) == mp.end());
         mp[seq].my_time = get_current_time();
-        mp[seq].index = index;
-        index++;
-        if (index == int(anti_replay_buff_size)) index = 0;
+        mp[seq].index = (int)index;
+        index = (index + 1) % anti_replay_buff_size;
     }
     int is_valid(u32_t seq) {
         if (mp.find(seq) == mp.end()) return 1;
 
         if (get_current_time() - mp[seq].my_time > anti_replay_timeout) {
-            replay_buffer[mp[seq].index] = u64_t(i64_t(-1));
+            // Keep the slot reusable. Its map entry is gone, and a later
+            // insertion will overwrite it once the bounded ring fills.
+            replay_buffer[mp[seq].index] = u32_t(-1);
             mp.erase(seq);
             return 1;
         }
@@ -242,7 +251,7 @@ struct anti_replay_t {
 };
 
 struct blob_encode_t {
-    char input_buf[(max_fec_packet_num + 5) * buf_len];
+    vector<char> input_buf;
     int current_len;
     int counter;
 
@@ -251,6 +260,7 @@ struct blob_encode_t {
     blob_encode_t();
 
     int clear();
+    void release_memory();
 
     int get_num();
     int get_shard_len(int n);
@@ -261,16 +271,17 @@ struct blob_encode_t {
 };
 
 struct blob_decode_t {
-    char input_buf[(max_fec_packet_num + 5) * buf_len];
+    vector<char> input_buf;
     int current_len;
     int last_len;
     int counter;
 
-    char *output_buf[max_blob_packet_num + 100];
-    int output_len[max_blob_packet_num + 100];
+    vector<char *> output_buf;
+    vector<int> output_len;
 
     blob_decode_t();
     int clear();
+    void release_memory();
     int input(char *input, int len);
     int output(int &n, char **&output, int *&len_arr);
 };
@@ -292,7 +303,7 @@ class fec_encode_manager_t : not_copy_able_t {
     my_time_t first_packet_time_for_output;
 
     blob_encode_t blob_encode;
-    char input_buf[max_fec_packet_num + 5][buf_len];
+    vector<char> input_buf;
     int input_len[max_fec_packet_num + 100];
 
     char *output_buf[max_fec_packet_num + 100];
@@ -306,6 +317,7 @@ class fec_encode_manager_t : not_copy_able_t {
     u32_t output_n;
 
     int append(char *s, int len);
+    char *input_slot(int index);
 
     ev_timer timer;
     struct ev_loop *loop = 0;
@@ -378,16 +390,18 @@ class fec_encode_manager_t : not_copy_able_t {
     int reset_fec_parameter(int data_num, int redundant_num, int mtu, int pending_num, int pending_time, int type);
     int input(char *s, int len /*,int &is_first_packet*/);
     int output(int &n, char **&s_arr, int *&len);
+    // Output buffers are borrowed by the caller. Call this only after the
+    // caller has synchronously queued or sent the returned packets.
+    void release_output_storage() {
+        if (is_idle()) {
+            vector<char>().swap(input_buf);
+            blob_encode.release_memory();
+        }
+    }
 };
 struct fec_data_t {
-    int used;
-    u32_t seq;
-    int type;
-    int data_num;
-    int redundant_num;
-    int idx;
-    char buf[buf_len];
     int len;
+    vector<char> buf;
 };
 struct fec_group_t {
     int type = -1;
@@ -398,15 +412,17 @@ struct fec_group_t {
     my_time_t first_seen_time = 0;
     int highest_inner_index = -1;
     // int data_counter=0;
-    map<int, int> group_mp;
+    map<int, fec_data_t> group_mp;
 };
 class fec_decode_manager_t : not_copy_able_t {
     anti_replay_t anti_replay;
-    fec_data_t *fec_data = 0;
     unordered_map<u32_t, fec_group_t> mp;
     blob_decode_t blob_decode;
 
-    int index;
+    size_t retained_payload_bytes = 0;
+    size_t retained_shard_count = 0;
+    u32_t completed_group_seq = 0;
+    int has_completed_group = 0;
 
     int output_n;
     char **output_s_arr;
@@ -419,8 +435,6 @@ class fec_decode_manager_t : not_copy_able_t {
 
    public:
     fec_decode_manager_t() {
-        fec_data = new fec_data_t[fec_buff_num + 5];
-        assert(fec_data != 0);
         clear();
     }
     /*
@@ -429,21 +443,16 @@ class fec_decode_manager_t : not_copy_able_t {
             assert(0==1);//not allowed to copy
     }*/
     ~fec_decode_manager_t() {
-        mylog(log_debug, "fec_decode_manager destroyed\n");
-        if (fec_data != 0) {
-            mylog(log_debug, "fec_data freed\n");
-            delete[] fec_data;
-        }
     }
     int clear() {
         anti_replay.clear();
         mp.clear();
-        mp.rehash(fec_buff_num * 3);
-
-        for (int i = 0; i < (int)fec_buff_num; i++)
-            fec_data[i].used = 0;
+        mp.rehash(0);
+        retained_payload_bytes = 0;
+        retained_shard_count = 0;
+        has_completed_group = 0;
+        blob_decode.release_memory();
         ready_for_output = 0;
-        index = 0;
         statistics = fec_decode_stats_t();
 
         return 0;
@@ -452,12 +461,30 @@ class fec_decode_manager_t : not_copy_able_t {
     // int re_init();
     int input(char *s, int len);
     int output(int &n, char **&s_arr, int *&len_arr);
+    // Called after output pointers have been consumed. It frees completed
+    // groups immediately instead of retaining their full shards for the old
+    // fixed decoder window.
+    void release_output_storage();
     int take_statistics(fec_decode_stats_t &stats) {
         stats = statistics;
         statistics = fec_decode_stats_t();
         return 0;
     }
+    size_t buffered_payload_bytes() const {
+        return retained_payload_bytes;
+    }
+    size_t buffered_shard_count() const {
+        return retained_shard_count;
+    }
     int expire_incomplete_groups(my_time_t maximum_age_us);
+   private:
+    void erase_group(unordered_map<u32_t, fec_group_t>::iterator it, int account_loss);
+    int make_room(size_t bytes, u32_t protected_seq);
 };
+
+// Cheap pre-admission validation used by the server before it constructs a
+// peer context. It validates only a complete wire frame; FEC recovery still
+// happens in fec_decode_manager_t after a peer has been admitted.
+int validate_fec_frame(const char *s, int len);
 
 #endif /* FEC_MANAGER_H_ */
