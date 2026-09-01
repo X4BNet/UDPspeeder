@@ -475,6 +475,8 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
         }
         if (!peer_capable) {
             peer_capable = 1;
+            normal_profile_validated = 1;
+            profile_dirty = 1;
             // Reply exactly once to a newly discovered peer. Re-acknowledging
             // every compatible legacy probe creates an idle control ping-pong
             // and adds an avoidable packet beside each direct-bypass payload.
@@ -496,6 +498,8 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
     if (kind == adaptive_fec_hello) {
         if (!peer_capable) {
             peer_capable = 1;
+            normal_profile_validated = 1;
+            profile_dirty = 1;
             hello_response_pending = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
@@ -520,14 +524,12 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
             peer_capable = 1;
             mylog(log_info, "adaptive-fec peer capability confirmed\n");
         }
-        // Do not put a new tunnel into the zero-redundancy normal profile
-        // merely because it can parse control frames.  A feedback frame means
-        // the receiver has successfully observed the current FEC-protected
-        // traffic, so it is now safe to select the adaptive profile.
+        // Older peers can send feedback without a preceding probe. Treat it
+        // as direct-path capability confirmation as well.
         if (!normal_profile_validated) {
             normal_profile_validated = 1;
             profile_dirty = 1;
-            mylog(log_info, "adaptive-fec initial receiver feedback confirmed\n");
+            mylog(log_info, "adaptive-fec direct path confirmed\n");
         }
         update_from_feedback(stats);
         if (adaptive_fec_statistics_enabled) statistics.control_received_packets++;
@@ -561,6 +563,25 @@ adaptive_fec_inbound_result_t adaptive_fec_controller_t::process_inbound(char *d
 
     mylog(log_warn, "unknown adaptive-fec control frame\n");
     return adaptive_fec_consumed;
+}
+
+int validate_adaptive_fec_frame(const char *data, int len) {
+    if (!g_adaptive_fec_config.enabled || data == 0) return -1;
+    if (len < adaptive_fec_header_len + adaptive_fec_mac_len ||
+        (unsigned char)data[sizeof(u32_t)] != adaptive_fec_frame_type ||
+        (unsigned char)data[sizeof(u32_t) + 2] != adaptive_fec_protocol_version ||
+        read_u32((char *)data + sizeof(u32_t) + 4 * sizeof(char)) != adaptive_fec_magic) {
+        return -1;
+    }
+    int payload_length = len - adaptive_fec_mac_len;
+    u64_t expected = (u64_t(read_u32((char *)data + payload_length)) << 32) | read_u32((char *)data + payload_length + sizeof(u32_t));
+    if (adaptive_fec_mac(data, payload_length) != expected) return -1;
+
+    int kind = (unsigned char)data[sizeof(u32_t) + 1];
+    if (kind == adaptive_fec_hello) return 0;
+    if (kind == adaptive_fec_feedback) return len == adaptive_fec_feedback_len ? 0 : -1;
+    if (kind == adaptive_fec_bypass_frame) return len >= adaptive_fec_bypass_header_len + adaptive_fec_mac_len ? 0 : -1;
+    return -1;
 }
 
 void adaptive_fec_controller_t::report_statistics(const char *role) {
@@ -612,14 +633,16 @@ int adaptive_fec_unit_test() {
     assert(receiver.process_inbound(corrupted_control, control_len, payload, payload_len) == adaptive_fec_consumed);
     assert(!receiver.can_bypass());
     assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
+    assert(receiver.can_bypass());
     assert(receiver.build_pending_control(control, control_len) == 1);
     assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
-    // Capability negotiation must retain the configured profile for the
-    // startup/control exchange.  It becomes eligible for the direct path
-    // only after the receiver returns actual FEC decode feedback.
-    assert(!sender.can_bypass());
+    // A verified capability handshake is enough to leave the static startup
+    // profile. This prevents sparse one-packet flows from waiting forever for
+    // a decode-feedback window that the oversized FEC group cannot produce.
+    assert(sender.can_bypass());
     fec_parameter_t pending_profile;
-    assert(sender.take_profile_update(pending_profile) == 0);
+    assert(sender.take_profile_update(pending_profile) == 1);
+    assert(profile_has_no_redundancy(pending_profile));
     // The initiator may send one acknowledgement for the responder's first
     // capability probe. The responder must not acknowledge that acknowledgement
     // forever.
@@ -627,20 +650,22 @@ int adaptive_fec_unit_test() {
     assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
     assert(receiver.build_pending_control(control, control_len) == 0);
 
-    fec_decode_stats_t initial_stats;
-    initial_stats.delivered_packets = 1;
-    receiver.observe_decoder_stats(initial_stats);
-    assert(receiver.build_pending_control(control, control_len) == 1);
-    assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
-    assert(sender.can_bypass());
-    assert(sender.take_profile_update(pending_profile) == 1);
-    assert(profile_has_no_redundancy(pending_profile));
-
     char test_payload[] = "adaptive-fec-bypass";
     assert(sender.build_bypass(test_payload, strlen(test_payload), control, control_len) == 0);
+    assert(validate_adaptive_fec_frame(control, control_len) == 0);
+    control[control_len - 1] ^= 1;
+    assert(validate_adaptive_fec_frame(control, control_len) != 0);
+    control[control_len - 1] ^= 1;
     assert(receiver.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_bypass);
     assert(payload_len == (int)strlen(test_payload));
     assert(memcmp(payload, test_payload, payload_len) == 0);
+
+    // The first direct packet supplies the first feedback sample; direct
+    // forwarding does not need to wait for that feedback to start.
+    assert(receiver.build_pending_control(control, control_len) == 1);
+    assert(sender.process_inbound(control, control_len, payload, payload_len) == adaptive_fec_consumed);
+    assert(sender.can_bypass());
+    assert(sender.take_profile_update(pending_profile) == 0);
 
     // Reorder two direct frames, then add enough in-order observations that
     // reordering alone is below the guard threshold. The delayed frame must

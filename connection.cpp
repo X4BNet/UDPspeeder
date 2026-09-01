@@ -33,6 +33,7 @@ void server_clear_function(u64_t u64)  // used in conv_manager in server mode.fo
 
 conn_manager_t::conn_manager_t() {
     mp.reserve(10007);
+    clear_it = mp.end();
     last_clear_time = 0;
 }
 int conn_manager_t::exist(address_t addr) {
@@ -126,5 +127,13 @@ int conn_manager_t::clear_inactive0() {
         cnt++;
     }
     clear_it = it;
+    return 0;
+}
+
+int conn_manager_t::expire_fec_incomplete_groups(my_time_t maximum_age_us) {
+    for (auto it = mp.begin(); it != mp.end(); ++it) {
+        conn_info_t *conn_info = it->second;
+        if (conn_info->fec_decode_manager != 0) conn_info->fec_decode_manager->expire_incomplete_groups(maximum_age_us);
+    }
     return 0;
 }

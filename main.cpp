@@ -59,7 +59,7 @@ static void print_help() {
     printf("    -i,--interval         imin:imax       similar to -i above, but scatter randomly between imin and imax\n");
     printf("    -q,--queue-len        <number>        fec queue len, only for mode 0, fec will be performed immediately after queue is full.\n");
     printf("                                          default value: 200. \n");
-    printf("    --decode-buf          <number>        maximum retained FEC shards; payload storage is additionally capped at 4 MiB\n");
+    printf("    --decode-buf          <number>        maximum retained FEC shards; payload storage is capped at 4 MiB per decoder / 8 MiB process-wide\n");
     //    printf("    --fix-latency         <number>        try to stabilize latency, only for mode 0\n");
     printf("    --delay-capacity      <number>        max number of delayed packets, 0 means unlimited, default: 0\n");
     printf("    --disable-fec         <number>        completely disable fec, turn the program into a normal udp tunnel\n");

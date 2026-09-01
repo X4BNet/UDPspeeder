@@ -17,10 +17,16 @@ const u32_t anti_replay_buff_size = 30000;  // can be set very large
 // Decoder payload is retained only while a FEC group is incomplete. Keep the
 // bound below a single-digit MiB even when --decode-buf is set excessively.
 const size_t fec_decode_payload_limit = 4 * 1024 * 1024;
+// The per-decoder limit alone is insufficient during a many-peer outage.
+// Bound all retained FEC payloads and shard objects in the process as well.
+const size_t fec_decode_global_payload_limit = 8 * 1024 * 1024;
+const size_t fec_decode_global_shard_limit = 4096;
 const int fec_incomplete_group_timeout_us = 1000 * 1000;
 
 const int max_fec_packet_num = 255;  // this is the limitation of the rs lib
 extern u32_t fec_buff_num;
+extern size_t fec_decode_global_retained_payload_bytes;
+extern size_t fec_decode_global_retained_shard_count;
 
 const int rs_str_len = max_fec_packet_num * 10 + 100;
 extern int header_overhead;
@@ -443,20 +449,9 @@ class fec_decode_manager_t : not_copy_able_t {
             assert(0==1);//not allowed to copy
     }*/
     ~fec_decode_manager_t() {
+        clear();
     }
-    int clear() {
-        anti_replay.clear();
-        mp.clear();
-        mp.rehash(0);
-        retained_payload_bytes = 0;
-        retained_shard_count = 0;
-        has_completed_group = 0;
-        blob_decode.release_memory();
-        ready_for_output = 0;
-        statistics = fec_decode_stats_t();
-
-        return 0;
-    }
+    int clear();
 
     // int re_init();
     int input(char *s, int len);

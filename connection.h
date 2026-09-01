@@ -41,9 +41,8 @@ struct conv_manager_t  // manage the udp connections
 
     long long last_clear_time;
 
-    conv_manager_t() {
+    conv_manager_t() : last_clear_time(0) {
         // clear_it=conv_last_active_time.begin();
-        long long last_clear_time = 0;
         additional_clear_function = 0;
     }
     ~conv_manager_t() {
@@ -353,6 +352,7 @@ struct conn_manager_t  // manager for connections. for client,we dont need conn_
     int erase(unordered_map<address_t, conn_info_t *>::iterator erase_it);
     int clear_inactive();
     int clear_inactive0();
+    int expire_fec_incomplete_groups(my_time_t maximum_age_us);
 };
 
 extern conn_manager_t conn_manager;

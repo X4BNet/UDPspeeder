@@ -31,6 +31,8 @@ int short_packet_optimize = 1;
 int header_overhead = 40;
 
 u32_t fec_buff_num = 2000;  // how many packet can fec_decode_manager hold. shouldn't be very large,or it will cost huge memory
+size_t fec_decode_global_retained_payload_bytes = 0;
+size_t fec_decode_global_retained_shard_count = 0;
 
 blob_encode_t::blob_encode_t() {
     clear();
@@ -291,10 +293,19 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
             actual_redundant_num = tail_y;
 
             if (short_packet_optimize) {
-                u32_t best_len = (blob_encode.get_shard_len(tail_x, 0) + header_overhead) * (tail_x + tail_y);
-                int best_data_num = tail_x;
+                // A mode-0 blob can hold fewer application packets than the
+                // FEC data width. Choosing (for example) 2:5 for a blob with
+                // one small TLS datagram turns it into seven wire packets
+                // even though 1:4 is available. Limit the optimizer to the
+                // blob count; exceed it only when a larger width is needed to
+                // keep a large packet below the MTU.
+                int blob_packet_count = blob_encode.get_num();
+                assert(blob_packet_count > 0);
+                u32_t best_len = 0;
+                int best_data_num = 0;
+                int smallest_mtu_safe_data_num = 0;
                 assert(tail_x <= fec_par.rs_cnt);
-                for (int i = 1; i < tail_x; i++) {
+                for (int i = 1; i <= tail_x; i++) {
                     assert(fec_par.rs_par[i - 1].x == i);
                     int tmp_x = fec_par.rs_par[i - 1].x;
                     int tmp_y = fec_par.rs_par[i - 1].y;
@@ -302,12 +313,17 @@ int fec_encode_manager_t::input(char *s, int len /*,int &is_first_packet*/) {
                     u32_t shard_len = blob_encode.get_shard_len(tmp_x, 0);
                     if (shard_len > (u32_t)fec_par.mtu) continue;
 
+                    if (smallest_mtu_safe_data_num == 0) smallest_mtu_safe_data_num = tmp_x;
+                    if (tmp_x > blob_packet_count) continue;
+
                     u32_t new_len = (shard_len + header_overhead) * (tmp_x + tmp_y);
-                    if (new_len < best_len) {
+                    if (best_data_num == 0 || new_len < best_len) {
                         best_len = new_len;
                         best_data_num = tmp_x;
                     }
                 }
+                if (best_data_num == 0) best_data_num = smallest_mtu_safe_data_num;
+                if (best_data_num == 0) best_data_num = tail_x;  // retain the legacy oversized-MTU fallback
                 actual_data_num = best_data_num;
                 assert(best_data_num >= 1 && best_data_num <= fec_par.rs_cnt);
                 actual_redundant_num = fec_par.rs_par[best_data_num - 1].y;
@@ -539,6 +555,26 @@ int validate_fec_frame(const char *s, int len) {
     return inner_index < data_num + redundant_num ? 0 : -1;
 }
 
+int fec_decode_manager_t::clear() {
+    // Decoders can be destroyed while incomplete groups are retained.
+    // Return their quota before clearing the containers themselves.
+    assert(fec_decode_global_retained_payload_bytes >= retained_payload_bytes);
+    assert(fec_decode_global_retained_shard_count >= retained_shard_count);
+    fec_decode_global_retained_payload_bytes -= retained_payload_bytes;
+    fec_decode_global_retained_shard_count -= retained_shard_count;
+    anti_replay.clear();
+    mp.clear();
+    mp.rehash(0);
+    retained_payload_bytes = 0;
+    retained_shard_count = 0;
+    has_completed_group = 0;
+    blob_decode.release_memory();
+    ready_for_output = 0;
+    statistics = fec_decode_stats_t();
+
+    return 0;
+}
+
 void fec_decode_manager_t::erase_group(unordered_map<u32_t, fec_group_t>::iterator it, int account_loss) {
     u32_t seq = it->first;
     fec_group_t &group = it->second;
@@ -552,15 +588,19 @@ void fec_decode_manager_t::erase_group(unordered_map<u32_t, fec_group_t>::iterat
     }
     for (auto shard = group.group_mp.begin(); shard != group.group_mp.end(); ++shard) {
         retained_payload_bytes -= shard->second.buf.size();
+        fec_decode_global_retained_payload_bytes -= shard->second.buf.size();
     }
     retained_shard_count -= group.group_mp.size();
+    fec_decode_global_retained_shard_count -= group.group_mp.size();
     anti_replay.set_invalid(seq);
     mp.erase(it);
 }
 
 int fec_decode_manager_t::make_room(size_t bytes, u32_t protected_seq) {
     if (bytes > fec_decode_payload_limit) return -1;
-    while (retained_shard_count >= fec_buff_num || retained_payload_bytes + bytes > fec_decode_payload_limit) {
+    while (retained_shard_count >= fec_buff_num || retained_payload_bytes + bytes > fec_decode_payload_limit ||
+           fec_decode_global_retained_shard_count >= fec_decode_global_shard_limit ||
+           fec_decode_global_retained_payload_bytes + bytes > fec_decode_global_payload_limit) {
         auto victim = mp.end();
         for (auto it = mp.begin(); it != mp.end(); ++it) {
             if (it->first == protected_seq) continue;
@@ -661,6 +701,8 @@ int fec_decode_manager_t::input(char *s, int len) {
     shard.buf.assign(s + header_len, s + header_len + payload_len);
     retained_payload_bytes += shard.buf.size();
     retained_shard_count++;
+    fec_decode_global_retained_payload_bytes += shard.buf.size();
+    fec_decode_global_retained_shard_count++;
     group.group_mp.emplace(inner_index, std::move(shard));
     if (group.highest_inner_index >= 0 && inner_index < group.highest_inner_index) statistics.reordered_packets++;
     if (inner_index > group.highest_inner_index) group.highest_inner_index = inner_index;
@@ -760,6 +802,7 @@ int fec_decode_manager_t::input(char *s, int len) {
             output_s_arr_buf[it->first] = it->second.buf.data();
         }
         retained_payload_bytes += padding;
+        fec_decode_global_retained_payload_bytes += padding;
         for (int i = 0; i < group_data_num; i++) {
             if (output_s_arr_buf[i] == 0 || i == inner_index) missed_packet[missed_packet_counter++] = i;
         }

@@ -159,6 +159,20 @@ static void process_remote_datagram(conn_info_t &conn_info, char *data, int data
 
         output_batch.add(out_delay[i], dest, new_data, new_len);
     }
+
+    // Return the capability acknowledgement immediately instead of holding
+    // the peer in static startup FEC until the periodic connection timer.
+    if (conn_info.adaptive_fec.needs_immediate_control()) {
+        char *control_data = 0;
+        int control_len = 0;
+        if (conn_info.adaptive_fec.build_pending_control(control_data, control_len)) {
+            dest_t control_dest;
+            control_dest.type = type_fd64;
+            control_dest.inner.fd64 = conn_info.remote_fd64;
+            control_dest.cook = 1;
+            output_batch.add(0, control_dest, control_data, control_len);
+        }
+    }
     if (conn_info.fec_decode_manager != 0) conn_info.fec_decode_manager->release_output_storage();
 }
 
@@ -240,6 +254,8 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
 
     // read(conn_info.timer.get_timer_fd(), &value, 8);
     conn_info.conv_manager.c.clear_inactive();
+    if (conn_info.fec_decode_manager != 0)
+        conn_info.fec_decode_manager->expire_incomplete_groups(g_adaptive_fec_config.enabled ? g_adaptive_fec_config.incomplete_group_timeout_us : fec_incomplete_group_timeout_us);
     mylog(log_trace, "events[idx].data.u64==(u64_t)conn_info.timer.get_timer_fd()\n");
 
     if (conn_info.stat.report_as_client()) conn_info.adaptive_fec.report_statistics("client");

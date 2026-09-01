@@ -30,6 +30,10 @@ struct adaptive_fec_config_t {
 };
 
 extern adaptive_fec_config_t g_adaptive_fec_config;
+// Validate a complete type-2 adaptive control/direct frame without creating
+// per-peer FEC state. Server admission uses this for a reconnect whose first
+// packet is already on the direct-bypass path.
+int validate_adaptive_fec_frame(const char *data, int len);
 // Counters are intentionally opt-in.  They add a predictable branch to the
 // direct path, but must not add per-packet writes to a production tunnel.
 extern int adaptive_fec_statistics_enabled;
@@ -71,9 +75,9 @@ class adaptive_fec_controller_t : not_copy_able_t {
     adaptive_fec_config_t config;
     adaptive_fec_state_t state;
     int peer_capable;
-    // Keep the configured static FEC profile until the peer has reported one
-    // real decode window.  Capability negotiation alone says nothing about
-    // whether the path is safe for an unprotected OpenVPN bootstrap packet.
+    // A successful authenticated capability exchange proves that both ends
+    // understand direct-bypass frames.  Do not leave a sparse bootstrap flow
+    // trapped in the static FEC profile waiting for a decode-feedback window.
     int normal_profile_validated;
     int profile_dirty;
     int hello_response_pending;
@@ -113,6 +117,9 @@ class adaptive_fec_controller_t : not_copy_able_t {
         return config.enabled;
     }
     int can_bypass() const;
+    int needs_immediate_control() const {
+        return config.enabled && hello_response_pending;
+    }
     adaptive_fec_state_t get_state() const {
         return state;
     }

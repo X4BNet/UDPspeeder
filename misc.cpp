@@ -246,6 +246,7 @@ int from_fec_to_normal(conn_info_t &conn_info, char *data, int len, int &out_n, 
         int bypass_payload_len = 0;
         adaptive_fec_inbound_result_t adaptive_result = conn_info.adaptive_fec.process_inbound(data, len, bypass_payload, bypass_payload_len);
         if (adaptive_result == adaptive_fec_consumed) {
+            mylog(log_debug, "adaptive-fec control frame consumed, len=%d\n", len);
             out_n = 0;
         } else if (adaptive_result == adaptive_fec_bypass) {
             static char *bypass_out_arr;
@@ -260,7 +261,7 @@ int from_fec_to_normal(conn_info_t &conn_info, char *data, int len, int &out_n, 
             inner_stat.output_packet_size += bypass_payload_len;
         } else {
             fec_decode_manager_t &decoder = conn_info.ensure_fec_decode_manager();
-            decoder.input(data, len);
+            int decode_ret = decoder.input(data, len);
             decoder.expire_incomplete_groups(g_adaptive_fec_config.enabled ? g_adaptive_fec_config.incomplete_group_timeout_us : fec_incomplete_group_timeout_us);
 
             fec_decode_stats_t decoder_stats;
@@ -269,6 +270,15 @@ int from_fec_to_normal(conn_info_t &conn_info, char *data, int len, int &out_n, 
 
             decoder.output(out_n, out_arr, out_len);
             if (out_n < 0) out_n = 0;
+            if (decode_ret != 0) {
+                mylog(log_debug, "fec frame rejected before forwarding, len=%d\n", len);
+            } else if (out_n == 0 && len >= (int)(sizeof(u32_t) + 4 * sizeof(char))) {
+                mylog(log_trace, "fec frame buffered, seq=%08x type=%u x=%u y=%u index=%u\n",
+                      read_u32(data), (unsigned int)(unsigned char)data[sizeof(u32_t)],
+                      (unsigned int)(unsigned char)data[sizeof(u32_t) + 1],
+                      (unsigned int)(unsigned char)data[sizeof(u32_t) + 2],
+                      (unsigned int)(unsigned char)data[sizeof(u32_t) + 3]);
+            }
             for (int i = 0; i < out_n; i++) {
                 out_delay_buf[i] = 0;
 
@@ -457,6 +467,32 @@ int unit_test() {
         assert(decoded_lengths[0] == (int)strlen(packet));
         assert(memcmp(decoded[0], packet, decoded_lengths[0]) == 0);
 
+        // A timeout can flush a one-packet blob. Do not select the 2:5
+        // coding width merely because it has a lower byte-cost estimate:
+        // sparse TLS/control traffic must use the available 1:4 profile.
+        char sparse_profile[] = "1:4,2:5,10:14,20:20,100:82";
+        assert(g_fec_par.rs_from_str(sparse_profile) == 0);
+        g_fec_par.version++;
+        g_fec_par.mode = 0;
+        fec_encode_manager_t *sparse_encoder = new fec_encode_manager_t;
+        fec_decode_manager_t sparse_decoder;
+        assert(sparse_encoder != 0);
+        sparse_encoder->set_loop_and_cb(ev_default_loop(0), empty_cb);
+        char sparse_packet[80];
+        memset(sparse_packet, 's', sizeof(sparse_packet));
+        assert(sparse_encoder->input(sparse_packet, sizeof(sparse_packet)) == 0);
+        assert(sparse_encoder->input(0, 0) == 0);
+        assert(sparse_encoder->output(encoded_count, encoded, encoded_lengths) == 0);
+        assert(encoded_count == 5);
+        assert(sparse_decoder.input(encoded[4], encoded_lengths[4]) == 0);
+        assert(sparse_decoder.output(decoded_count, decoded, decoded_lengths) == 0);
+        assert(decoded_count == 1);
+        assert(decoded_lengths[0] == (int)sizeof(sparse_packet));
+        assert(memcmp(decoded[0], sparse_packet, sizeof(sparse_packet)) == 0);
+        delete sparse_encoder;
+
+        assert(g_fec_par.rs_from_str(k1_profile) == 0);
+        g_fec_par.version++;
         g_fec_par.mode = 1;
         fec_encode_manager_t *mode_one_encoder = new fec_encode_manager_t;
         fec_decode_manager_t *mode_one_decoder = new fec_decode_manager_t;
@@ -536,6 +572,21 @@ int unit_test() {
         }
         assert(bounded_decoder.buffered_payload_bytes() <= fec_decode_payload_limit);
         assert(bounded_decoder.buffered_shard_count() <= fec_buff_num);
+
+        // The cap applies across peers as well as within one decoder. A
+        // many-peer outage must shed old FEC shards instead of growing with
+        // the number of source addresses.
+        fec_decode_manager_t second_bounded_decoder;
+        for (int i = 1500; i < 3000; i++) {
+            write_u32(frame, (u32_t)i);
+            assert(second_bounded_decoder.input(frame, frame_len) == 0);
+        }
+        assert(fec_decode_global_retained_payload_bytes <= fec_decode_global_payload_limit);
+        assert(fec_decode_global_retained_shard_count <= fec_decode_global_shard_limit);
+        assert(bounded_decoder.clear() == 0);
+        assert(second_bounded_decoder.clear() == 0);
+        assert(fec_decode_global_retained_payload_bytes == 0);
+        assert(fec_decode_global_retained_shard_count == 0);
 
         // A decoded group is only kept while its output pointers are in use.
         // Once delivered, all of its FEC shards are released immediately.

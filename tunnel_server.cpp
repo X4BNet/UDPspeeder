@@ -153,7 +153,11 @@ static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, ch
         // Keep an unauthenticated/unrecognised source in the tiny admission
         // path. A connection used to allocate every FEC buffer here before
         // the decoder could reject even a malformed inner frame.
-        if (validate_fec_frame(data, data_len) != 0) {
+        // A reconnect can legitimately send its first payload as an
+        // authenticated adaptive-FEC direct-bypass (type 2) frame. The FEC
+        // validator deliberately accepts only types 0/1, so admit type 2
+        // only after its full control header and MAC have been verified.
+        if (validate_fec_frame(data, data_len) != 0 && validate_adaptive_fec_frame(data, data_len) != 0) {
             mylog(log_debug, "ignored new peer with invalid fec frame\n");
             return;
         }
@@ -253,6 +257,26 @@ static void process_local_datagram(struct ev_loop *loop, int local_listen_fd, ch
             output_batch->add(out_delay[i], dest, new_data, new_len);
         else
             delay_send(out_delay[i], dest, new_data, new_len);
+    }
+
+    // Answer a verified adaptive-FEC probe in this receive turn. Waiting for
+    // the 400 ms maintenance timer prolongs the static, high-redundancy
+    // bootstrap phase and can make a sparse TLS handshake self-sustainingly
+    // lossy.
+    if (conn_info.adaptive_fec.needs_immediate_control()) {
+        char *control_data = 0;
+        int control_len = 0;
+        if (conn_info.adaptive_fec.build_pending_control(control_data, control_len)) {
+            dest_t control_dest;
+            control_dest.inner.fd_addr.fd = local_listen_fd;
+            control_dest.inner.fd_addr.addr = addr;
+            control_dest.type = type_fd_addr;
+            control_dest.cook = 1;
+            if (output_batch != 0)
+                output_batch->add(0, control_dest, control_data, control_len);
+            else
+                delay_send(0, control_dest, control_data, control_len);
+        }
     }
     if (conn_info.fec_decode_manager != 0) conn_info.fec_decode_manager->release_output_storage();
 }
@@ -375,6 +399,7 @@ static void global_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int 
 
     // uint64_t value;
     // read(timer.get_timer_fd(), &value, 8);
+    conn_manager.expire_fec_incomplete_groups(g_adaptive_fec_config.enabled ? g_adaptive_fec_config.incomplete_group_timeout_us : fec_incomplete_group_timeout_us);
     conn_manager.clear_inactive();
     mylog(log_trace, "events[idx].data.u64==(u64_t)timer.get_timer_fd()\n");
 }
